@@ -181,6 +181,46 @@ def cmd_download_models(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    config, report = _load(args)
+    if not report.ok:
+        _print_report(report)
+        return 1
+    try:
+        from opengaze.desktop.calibration_ui import run_calibration
+    except ImportError as exc:
+        print(f"desktop UI unavailable ({exc}); install with: pip install -e '.[desktop]'")
+        return 1
+    ensure_camera_permission(report)
+    return run_calibration(report, config)
+
+
+def cmd_calibration_info(args: argparse.Namespace) -> int:
+    """Print info about the stored calibration for the current hardware profile."""
+    from opengaze.calibration.storage import CalibrationStore
+    from opengaze.modes import TrackingMode, infer_mode
+
+    config, report = _load(args)
+    if not report.ok:
+        _print_report(report)
+        return 1
+    assert report.profile is not None
+    mode = infer_mode({cam.role for cam in report.profile.enabled_cameras.values()})
+    schema_map = {
+        TrackingMode.A: "A-webcam",
+        TrackingMode.B: "B-single-eye",
+        TrackingMode.C: "C-dual-eye",
+    }
+    schema_id = schema_map.get(mode, "A-webcam")  # type: ignore[arg-type]
+    store = CalibrationStore()
+    compat = store.compatibility(schema_id, report.profile)  # type: ignore[arg-type]
+    if compat is None:
+        print(f"No calibration found for schema={schema_id!r} with the current hardware profile.")
+        return 1
+    print(compat.explain())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="opengaze", description=__doc__)
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -219,6 +259,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", help="save to this path instead of the default cache location")
     p.add_argument("--force", action="store_true", help="re-download even if already present")
     p.set_defaults(func=cmd_download_models)
+
+    p = sub.add_parser("calibrate", help="run the 9-point gaze calibration wizard (PySide6)")
+    add_profile_args(p)
+    p.set_defaults(func=cmd_calibrate)
+
+    p = sub.add_parser("calibration-info", help="show stored calibration status for this profile")
+    add_profile_args(p)
+    p.set_defaults(func=cmd_calibration_info)
 
     return parser
 
