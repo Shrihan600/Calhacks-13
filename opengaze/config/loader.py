@@ -192,14 +192,52 @@ def semantic_issues(profile: HardwareProfile) -> list[ValidationIssue]:
                 "no head camera: head movement can't be compensated, so keep the head still",
             )
         )
-    if profile.calibration.geometry_estimation == "geometric":
-        issues.append(
-            ValidationIssue(
-                "error",
-                "calibration.geometry_estimation",
-                "geometric estimation is not implemented yet; use data_driven",
+    issues += _gaze_issues(profile, mode)
+    return issues
+
+
+def _gaze_issues(profile: HardwareProfile, mode: TrackingMode | None) -> list[ValidationIssue]:
+    from opengaze.gaze.detector2d import DETECTORS_2D
+    from opengaze.gaze.eye_model3d import EYE_MODELS_3D
+
+    issues: list[ValidationIssue] = []
+    gaze = profile.gaze
+    components = [("gaze.detector_2d", gaze.detector_2d, DETECTORS_2D)]
+    if gaze.pipeline == "eye_3d":
+        components.append(("gaze.eye_model_3d", gaze.eye_model_3d, EYE_MODELS_3D))
+    for loc, component, registry in components:
+        cls = registry.get(component.type)
+        if cls is None:
+            issues.append(
+                ValidationIssue(
+                    "error",
+                    f"{loc}.type",
+                    f"unknown {component.type!r}; available: {sorted(registry)}",
+                )
             )
-        )
+            continue
+        try:
+            cls.Options.model_validate(component.options)
+        except ValidationError as exc:
+            issues += _pydantic_issues(exc, f"{loc}.options")
+
+    if profile.calibration.geometry_estimation == "geometric":
+        if mode in (None, TrackingMode.WEBCAM_ONLY):
+            issues.append(
+                ValidationIssue(
+                    "error",
+                    "calibration.geometry_estimation",
+                    "geometric estimation needs eye cameras (Mode B/C); use data_driven",
+                )
+            )
+        elif gaze.pipeline != "eye_3d":
+            issues.append(
+                ValidationIssue(
+                    "error",
+                    "calibration.geometry_estimation",
+                    "geometric estimation needs a 3D gaze vector; set gaze.pipeline: eye_3d",
+                )
+            )
     return issues
 
 

@@ -27,3 +27,38 @@ privacy:
   allow_recording: false
   # Cloud features (Claude, Cartesia, Convex) are opt-in; raw images are never sent regardless.
   cloud_features_enabled: false
+
+# Eye gestures and their keybinds. Every gesture is always detected (and shown in the test
+# environment); only bound ones do anything. A binding is exactly one of:
+#   key:   a system keystroke, e.g. "cmd+shift+tab", "page_down", "alt+left"
+#   mouse: click | right_click | double_click | middle_click | scroll_up/down/left/right
+#          (at the gaze position)
+#   app:   pause | toggle_cursor | recalibrate | keyboard | practice | quit
+# key/mouse bindings only fire while cursor control is ON; app bindings always fire.
+# Winks need both eyes observed (Mode A or C). Glances need a calibration.
+gestures:
+  enabled: true
+  blink:
+    long_blink_ms: 400
+    short_blink_max_ms: 300
+    multi_blink_gap_ms: 450
+  wink:
+    min_wink_ms: 200
+    long_wink_ms: 800
+  glance:
+    edge_margin: 0.02        # how far past the screen edge counts (normalised screen units)
+    max_glance_ms: 700
+    hold_ms: 900
+    hold_repeat_ms: 350      # holds repeat while held (null = fire once)
+  bindings:
+    long_blink: {mouse: click}
+    double_blink: {mouse: double_click}
+    triple_blink: {app: toggle_cursor}
+    wink_left: {mouse: right_click}
+    wink_right: {key: "cmd+tab"}
+    long_wink_left: {app: pause}
+    long_wink_right: {app: recalibrate}
+    glance_left: {key: "cmd+["}
+    glance_right: {key: "cmd+]"}
+    hold_up: {mouse: scroll_up}
+    hold_down: {mouse: scroll_down}

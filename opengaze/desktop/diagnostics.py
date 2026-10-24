@@ -6,6 +6,7 @@ frame per camera on a timer, so a slow or dead camera can never freeze the UI.
 
 from __future__ import annotations
 
+import logging
 import sys
 
 import cv2
@@ -33,6 +34,8 @@ from opengaze.config.loader import ProfileReport
 from opengaze.config.schema import AppConfig
 from opengaze.vision.observations import EyeObservation, HeadObservation
 from opengaze.vision.preprocessing import FrameNormalizer
+
+log = logging.getLogger(__name__)
 
 STATE_COLORS = {
     CameraState.STREAMING: "#2e9e5b",

@@ -11,8 +11,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from opengaze.calibration.model import GazeModel, SchemaId
-from opengaze.calibration.session import CalibrationPoint
+from opengaze.calibration.model import GazeModel
+from opengaze.calibration.session import CalibrationPoint, MapperFactory, stack_points
+from opengaze.vision.observations import SchemaId
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,32 +56,38 @@ def validate_calibration(
     pass_threshold_norm: float = 0.08,
     screen_width_px: int | None = None,
     screen_height_px: int | None = None,
+    mapper_factory: MapperFactory | None = None,
 ) -> ValidationReport:
     """Leave-one-out cross-validation over accepted calibration points.
 
     Requires at least 5 accepted points (so each LOO fold still has ≥ 4).
     """
-    accepted = [(p.representative(), p) for p in points if p.accepted]
-    accepted = [(rep, p) for rep, p in accepted if rep is not None]
+    accepted = [p for p in points if p.accepted and p.representative() is not None]
 
     if len(accepted) < 5:
         raise ValueError(
             f"need at least 5 accepted points for LOO CV, got {len(accepted)}"
         )
 
-    reps = np.stack([rep for rep, _ in accepted]).astype(np.float32)
-    targets = np.array([[p.screen_x_norm, p.screen_y_norm] for _, p in accepted], dtype=np.float32)
+    factory = mapper_factory or (lambda: GazeModel(schema_id=schema_id, alpha=alpha))
+    reps, targets, valid = stack_points(accepted)
 
     point_errors: list[PointError] = []
     for i in range(len(accepted)):
         mask = np.ones(len(accepted), dtype=bool)
         mask[i] = False
-        X_train, y_train = reps[mask], targets[mask]
-        x_test, y_test = reps[i], targets[i]
+        y_test = targets[i]
 
-        m = GazeModel(schema_id=schema_id, alpha=alpha)
-        m.fit(X_train, y_train)
-        px_norm, py_norm = m.predict_raw(x_test)
+        m = factory()
+        try:
+            m.fit(reps[mask], targets[mask], valid[mask])
+            pred = m.predict_xy(reps[i], valid[i])
+        except ValueError:
+            pred = None  # this fold can't be fitted (e.g. the held-out point was needed)
+        if pred is None:
+            continue
+        px_norm = float(np.clip(pred[0], 0.0, 1.0))
+        py_norm = float(np.clip(pred[1], 0.0, 1.0))
 
         err_norm = float(np.sqrt((px_norm - y_test[0]) ** 2 + (py_norm - y_test[1]) ** 2))
         err_px = None
@@ -102,6 +109,8 @@ def validate_calibration(
             )
         )
 
+    if not point_errors:
+        raise ValueError("no leave-one-out fold could be fitted")
     errs_norm = [e.error_norm for e in point_errors]
     errs_px = [e.error_px for e in point_errors if e.error_px is not None]
 

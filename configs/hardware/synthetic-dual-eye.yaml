@@ -39,6 +39,10 @@ hardware_profile:
       options:
         pattern: test_card
 
+  gaze:
+    pipeline: pupil_2d           # 2D pupil detector → pupil centre (see synthetic-dual-eye-3d.yaml)
+    detector_2d: {type: ellipse_fit}
+
   calibration:
     screen_mapping: per_user
     geometry_estimation: data_driven

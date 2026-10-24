@@ -41,6 +41,13 @@ def _print_report(report: ProfileReport) -> None:
         p = report.profile
         print(f"id:          {p.id} (version {p.version}, frame design '{p.frame_design}')")
         print(f"mode:        {report.mode.label if report.mode else '—'}")
+        if report.mode is not None and report.mode.value != "A":
+            g = p.gaze
+            stages = g.detector_2d.type
+            if g.pipeline == "eye_3d":
+                stages += f" → {g.eye_model_3d.type}"
+            mapping = p.calibration.geometry_estimation
+            print(f"gaze:        {g.pipeline} ({stages}), {mapping} mapping")
         print(f"fingerprint: {profile_fingerprint(p)}")
         for cid, cam in p.cameras.items():
             state = "" if cam.enabled else "  [disabled]"
@@ -213,20 +220,14 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
 def cmd_calibration_info(args: argparse.Namespace) -> int:
     """Print info about the stored calibration for the current hardware profile."""
     from opengaze.calibration.storage import CalibrationStore
-    from opengaze.modes import TrackingMode, infer_mode
+    from opengaze.modes import profile_schema
 
     config, report = _load(args)
     if not report.ok:
         _print_report(report)
         return 1
     assert report.profile is not None
-    mode = infer_mode({cam.role for cam in report.profile.enabled_cameras.values()})
-    schema_map = {
-        TrackingMode.WEBCAM_ONLY: "A-webcam",
-        TrackingMode.SINGLE_EYE: "B-single-eye",
-        TrackingMode.DUAL_EYE: "C-dual-eye",
-    }
-    schema_id = schema_map.get(mode, "A-webcam")  # type: ignore[arg-type]
+    schema_id = profile_schema(report.profile)
     store = CalibrationStore()
     compat = store.compatibility(schema_id, report.profile)  # type: ignore[arg-type]
     if compat is None:

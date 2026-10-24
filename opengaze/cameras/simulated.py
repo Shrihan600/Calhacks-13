@@ -53,6 +53,10 @@ class SyntheticOptions(BaseModel):
     noise_std: float = Field(default=4.0, ge=0.0)
     illumination_gradient: float = Field(default=0.25, ge=0.0, le=1.0)
     pupil_radius: float = Field(default=0.08, gt=0.0, lt=0.5, description="fraction of short side")
+    # planar: the pupil slides as a circle (cheap, Phase 1 behaviour).
+    # spherical: the pupil sits on a rotating eyeball and foreshortens into an ellipse, which a
+    # 3D eye model needs. Ground truth then includes the gaze vector and eyeball geometry.
+    eye_model: Literal["planar", "spherical"] = "planar"
     blink_interval_s: float | None = Field(default=4.0, gt=0.0)
     blink_duration_s: float = Field(default=0.15, gt=0.0)
     saccade_interval_s: float = Field(default=1.2, gt=0.0)
@@ -125,11 +129,32 @@ def skin_background(width: int, height: int, gradient: float) -> np.ndarray:
     return np.tile(ramp.astype(np.uint8), (height, 1))
 
 
+# Spherical eye: eyeball radius as a fraction of image width, and the eye rotation that
+# looking at each screen edge takes.
+SPHERE_RADIUS_FRACTION = 0.32
+SPHERE_MAX_YAW_DEG = 28.0
+SPHERE_MAX_PITCH_DEG = 22.0
+
+
+def spherical_gaze_vector(gaze: tuple[float, float]) -> np.ndarray:
+    """Unit gaze direction in eye-camera coordinates (x right, y down, z into the scene) for a
+    normalised screen target; the eye looks back toward the camera, so z < 0.
+
+    Geometrically consistent with a flat screen centred in front of the eye whose edges are
+    SPHERE_MAX_YAW_DEG / SPHERE_MAX_PITCH_DEG away (so a ray-plane model can fit it exactly).
+    """
+    tx = 2.0 * (gaze[0] - 0.5) * math.tan(math.radians(SPHERE_MAX_YAW_DEG))
+    ty = 2.0 * (gaze[1] - 0.5) * math.tan(math.radians(SPHERE_MAX_PITCH_DEG))
+    v = np.array([tx, ty, -1.0])
+    return v / np.linalg.norm(v)
+
+
 def render_eye(
     background: np.ndarray,
     gaze: tuple[float, float],
     closure: float,
     pupil_radius_fraction: float,
+    spherical: bool = False,
 ) -> tuple[np.ndarray, dict[str, float]]:
     """Render an upright close-up eye (grayscale) and return it with its ground truth."""
     height, width = background.shape
@@ -140,17 +165,38 @@ def render_eye(
     iris_r = 0.20 * short
     pupil_r = pupil_radius_fraction * short
 
-    # Mildly nonlinear and cross-coupled, like the projection of a real eyeball, so a
-    # calibration model has something to learn beyond a linear map.
-    u, v = 2.0 * (gaze[0] - 0.5), 2.0 * (gaze[1] - 0.5)
-    px = cx + 0.30 * width * u * (1.0 - 0.15 * u * u)
-    py = cy + 0.20 * height * v * (1.0 - 0.15 * v * v) + 0.03 * height * u * u
-
     mask = np.zeros_like(background)
     cv2.ellipse(mask, (round(cx), round(cy)), (round(ax), round(ay)), 0, 0, 360, 255, -1)
     eye = np.full_like(background, 215)
-    cv2.circle(eye, (round(px), round(py)), round(iris_r), 95, -1, cv2.LINE_AA)
-    cv2.circle(eye, (round(px), round(py)), round(pupil_r), 25, -1, cv2.LINE_AA)
+    extra: dict[str, float] = {}
+    if spherical:
+        # Orthographic view of a pupil disc on a sphere: it moves by R·(gx, gy) and shrinks
+        # by |gz| along the radial direction.
+        g = spherical_gaze_vector(gaze)
+        radius = SPHERE_RADIUS_FRACTION * width
+        px, py = cx + radius * g[0], cy + radius * g[1]
+        squash = abs(g[2])
+        radial_deg = math.degrees(math.atan2(g[1], g[0]))
+        center = (round(px), round(py))
+        for r, level in ((iris_r, 95), (pupil_r, 25)):
+            axes = (max(1, round(r * squash)), round(r))
+            cv2.ellipse(eye, center, axes, radial_deg, 0, 360, level, -1, cv2.LINE_AA)
+        extra = {
+            "gaze_vec_x": float(g[0]),
+            "gaze_vec_y": float(g[1]),
+            "gaze_vec_z": float(g[2]),
+            "eye_center_x": cx,
+            "eye_center_y": cy,
+            "eye_radius": radius,
+        }
+    else:
+        # Mildly nonlinear and cross-coupled, like the projection of a real eyeball, so a
+        # calibration model has something to learn beyond a linear map.
+        u, v = 2.0 * (gaze[0] - 0.5), 2.0 * (gaze[1] - 0.5)
+        px = cx + 0.30 * width * u * (1.0 - 0.15 * u * u)
+        py = cy + 0.20 * height * v * (1.0 - 0.15 * v * v) + 0.03 * height * u * u
+        cv2.circle(eye, (round(px), round(py)), round(iris_r), 95, -1, cv2.LINE_AA)
+        cv2.circle(eye, (round(px), round(py)), round(pupil_r), 25, -1, cv2.LINE_AA)
     # Corneal reflection of an illuminator: moves less than the pupil does.
     gx = cx + 0.3 * (px - cx) + 0.15 * iris_r
     gy = cy + 0.3 * (py - cy) - 0.20 * iris_r
@@ -176,6 +222,7 @@ def render_eye(
         "pupil_radius": pupil_r,
         "eyelid_closure": closure,
         "pupil_visible": float(py - 0.3 * pupil_r > lid_y and closure < 0.6),
+        **extra,
     }
     return image, truth
 
@@ -349,7 +396,11 @@ class SyntheticCameraSource(CameraSource):
             assert self._background is not None
             closure = eyelid_closure(t, opts.blink_interval_s, opts.blink_duration_s)
             gray, truth = render_eye(
-                self._background, self._trajectory(t), closure, opts.pupil_radius
+                self._background,
+                self._trajectory(t),
+                closure,
+                opts.pupil_radius,
+                spherical=opts.eye_model == "spherical",
             )
             if opts.noise_std > 0:
                 noise = self._noise_rng.standard_normal(gray.shape, dtype=np.float32)

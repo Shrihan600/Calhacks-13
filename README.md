@@ -16,7 +16,7 @@ profile**. Nothing above the camera layer knows which hardware is in use. See
 | 2. Head pose + eye features (MediaPipe, pupil detector) | next |
 | 3. Calibration wizard + gaze model | planned |
 | 4. Quartz cursor, smoothing, dwell click, safety stop | planned |
-| 5. External eye cameras (USB / Pi / ESP32 streams), Modes B/C | planned |
+| 5. External eye cameras, Modes B/C: swappable 2D pupil / 3D eye-model pipelines, head-compensated screen mapping, eye-gesture keybinds | **done** (Pi / ESP32 stream adapters still planned) |
 | 6. Communication board, Claude, Cartesia, Convex | planned |
 | 7. Demo polish | planned |
 
@@ -95,6 +95,56 @@ image and the image after the profile's rotation, mirror and crop. Synthetic eye
 **GT** marker at the true pupil position, so you can check by eye that the orientation settings are
 right.
 
+## Eye cameras (Modes B/C)
+
+Each eye camera runs through one of two pipelines, picked by `gaze.pipeline` in the hardware
+profile. Each stage is a swappable component chosen by `type`:
+
+| pipeline | stages | feature per eye |
+|---|---|---|
+| `pupil_2d` | 2D pupil detector | pupil centre in the eye image |
+| `eye_3d` | 2D pupil detector → 3D eye model | unit gaze vector in eye-camera coordinates |
+
+Built-in components are `ellipse_fit`, an OpenCV dark-pupil detector, and `sphere_fit`, a
+weak-perspective eyeball fit in the style of pye3d. Pupil Labs' `pupil-detectors` and `pye3d`
+have no Apple Silicon wheels, so they aren't wired in. Adding an adapter means implementing
+`PupilDetector2D` / `EyeModel3D` (`opengaze/gaze/`) and registering it in `DETECTORS_2D` /
+`EYE_MODELS_3D`.
+
+Head pose (MediaPipe on the head camera) and calibration turn the features into a screen
+position. `calibration.geometry_estimation` picks how:
+
+- `data_driven` works with either pipeline. It fits a polynomial of the eye features plus
+  linear head-pose terms. Sub-models per eye subset keep it working when one eye blinks.
+- `geometric` needs `eye_3d`. It rotates each gaze ray by the fitted eye-camera rotation and
+  the measured head pose, then intersects it with the screen plane. It compensates head
+  movement that calibration never saw. It assumes the head camera sits top-centre on the
+  screen and its image is mirrored to match the screen.
+
+The 3D eye model learns during calibration, is frozen afterwards, and its state is saved with
+the calibration. If the glasses move on the face, recalibrate. Try it without hardware:
+
+```bash
+.venv/bin/opengaze run --profile configs/hardware/synthetic-dual-eye-3d.yaml
+```
+
+## Eye gestures and keybinds
+
+The same gestures work in every mode. Winks need both eyes observed.
+
+| family | gestures |
+|---|---|
+| blinks | `long_blink`, `double_blink`, `triple_blink` (single natural blinks are ignored) |
+| winks | `wink_left`, `wink_right`, `long_wink_left`, `long_wink_right` |
+| glances | `glance_left/right/up/down`: look past a screen edge and back. `hold_left/right/up/down`: stay there; repeats while held |
+
+Bind them under `gestures.bindings` in `configs/default.yaml`. Each binding is a system
+keystroke (`{key: "cmd+shift+tab"}`), a mouse action at the gaze point (`{mouse: right_click}`,
+`scroll_down`, …) or an OpenGaze action (`{app: pause}`, `toggle_cursor`, `recalibrate`, …).
+Key and mouse bindings only fire while cursor control is on (Tab, or a gesture bound to
+`toggle_cursor`). App bindings always fire, so the user can get back control hands-free.
+The test environment shows each gesture as it fires.
+
 ## Adding or changing hardware
 
 1. Copy a profile from `configs/hardware/` (`generic-usb.yaml` is a template).
@@ -141,7 +191,11 @@ configs/                 default.yaml + hardware profiles
 opengaze/cameras/        CameraFrame contract, CameraSource ABC, adapters, registry,
                          manager (reconnect, latest-frame slots), runtime thread, permissions
 opengaze/config/         pydantic schema, loader/validator, geometry fingerprint
-opengaze/vision/         preprocessing (frame normalization)
+opengaze/vision/         preprocessing, MediaPipe face/iris, feature schemas
+opengaze/gaze/           eye pipelines (2D pupil detector, 3D eye model), GazeTracker, GazeLoop
+opengaze/calibration/    session, LOO validation, storage, screen mappers (ridge/poly/geometric)
+opengaze/gestures/       blink/wink/glance detectors, recognizer, keybind dispatch
+opengaze/control/        Quartz cursor + keyboard events, smoothing, dwell, safety
 opengaze/desktop/        PySide6 diagnostics window
 opengaze/cli.py          `opengaze` command
 scripts/                 make_synthetic_recording.py

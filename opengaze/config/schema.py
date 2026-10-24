@@ -13,6 +13,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, PositiveInt, field_validator, model_validator
 
 from opengaze.cameras.types import CameraIntrinsics, CameraRole, CropRegion, Orientation
+from opengaze.gestures.config import GestureSettings
 
 ROLE_KEYS = {role.value for role in CameraRole}
 
@@ -147,7 +148,31 @@ class CameraConfig(_Model):
 
 class CalibrationPolicy(_Model):
     screen_mapping: Literal["per_user"] = "per_user"
+    # data_driven: polynomial regression from eye features + head pose to the screen.
+    # geometric: rotate the 3D gaze ray by head pose and intersect it with the screen plane
+    # (needs gaze.pipeline: eye_3d and eye cameras).
     geometry_estimation: Literal["data_driven", "geometric"] = "data_driven"
+
+
+class ComponentConfig(_Model):
+    """A swappable pipeline component: registered ``type`` name plus its own ``options``."""
+
+    type: str
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class GazePipelineConfig(_Model):
+    """How eye-camera images become gaze features (Modes B/C; ignored in Mode A).
+
+    pupil_2d: 2D pupil detector → pupil centre in the eye image.
+    eye_3d:   2D pupil detector → 3D eye model → gaze direction vector.
+    """
+
+    pipeline: Literal["pupil_2d", "eye_3d"] = "pupil_2d"
+    detector_2d: ComponentConfig = ComponentConfig(type="ellipse_fit")
+    eye_model_3d: ComponentConfig = ComponentConfig(type="sphere_fit")
+    # An eye counts as closed while its pupil-detection confidence is below this.
+    closed_below_confidence: float = Field(default=0.3, ge=0.0, le=1.0)
 
 
 class HardwareProfile(_Model):
@@ -157,6 +182,7 @@ class HardwareProfile(_Model):
     description: str = ""
     cameras: dict[str, CameraConfig] = Field(min_length=1)
     calibration: CalibrationPolicy = CalibrationPolicy()
+    gaze: GazePipelineConfig = GazePipelineConfig()
 
     @model_validator(mode="before")
     @classmethod
@@ -215,3 +241,4 @@ class AppConfig(_Model):
     diagnostics: DiagnosticsSettings = DiagnosticsSettings()
     vision: VisionSettings = VisionSettings()
     privacy: PrivacySettings = PrivacySettings()
+    gestures: GestureSettings = GestureSettings()

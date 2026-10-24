@@ -33,6 +33,7 @@ def errors(report) -> list[str]:
     [
         ("webcam-only.yaml", TrackingMode.WEBCAM_ONLY),
         ("synthetic-dual-eye.yaml", TrackingMode.DUAL_EYE),
+        ("synthetic-dual-eye-3d.yaml", TrackingMode.DUAL_EYE),
         ("synthetic-faults.yaml", TrackingMode.DUAL_EYE),
     ],
 )
@@ -134,10 +135,31 @@ def test_disabled_cameras_do_not_count() -> None:
     assert report.mode is TrackingMode.SINGLE_EYE
 
 
-def test_geometric_estimation_not_yet_supported() -> None:
+def test_geometric_estimation_needs_eye_cameras() -> None:
     data = profile(head={"source_type": "synthetic"})
     data["hardware_profile"]["calibration"] = {"geometry_estimation": "geometric"}
-    assert any("not implemented" in e for e in errors(check_profile_data(data)))
+    assert any("needs eye cameras" in e for e in errors(check_profile_data(data)))
+
+
+def test_geometric_estimation_needs_eye_3d_pipeline() -> None:
+    data = profile(left_eye={"source_type": "synthetic"})
+    data["hardware_profile"]["calibration"] = {"geometry_estimation": "geometric"}
+    assert any("eye_3d" in e for e in errors(check_profile_data(data)))
+    data["hardware_profile"]["gaze"] = {"pipeline": "eye_3d"}
+    report = check_profile_data(data)
+    assert report.ok, errors(report)
+
+
+def test_gaze_components_are_validated() -> None:
+    data = profile(left_eye={"source_type": "synthetic"})
+    data["hardware_profile"]["gaze"] = {
+        "pipeline": "eye_3d",
+        "detector_2d": {"type": "nope"},
+        "eye_model_3d": {"type": "sphere_fit", "options": {"buffer_sizee": 10}},
+    }
+    errs = errors(check_profile_data(data))
+    assert any(e.startswith("gaze.detector_2d.type") for e in errs)
+    assert any(e.startswith("gaze.eye_model_3d.options") for e in errs)
 
 
 def test_user_overlay_merges_over_profile(tmp_path: Path) -> None:

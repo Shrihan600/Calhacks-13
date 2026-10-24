@@ -7,7 +7,7 @@ Nothing is invented: a field is ``None`` when genuinely unknown.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 import numpy as np
 
@@ -66,6 +66,76 @@ FEATURE_NAMES_MODE_A: tuple[str, ...] = (
 )
 
 
+# One schema per mode × eye pipeline. A calibration is fitted for exactly one of these.
+SchemaId = Literal["A-webcam", "B-pupil2d", "C-pupil2d", "B-eye3d", "C-eye3d"]
+SCHEMA_IDS: tuple[str, ...] = get_args(SchemaId)
+
+_HEAD_NAMES = (
+    "head_yaw",
+    "head_pitch",
+    "head_roll",
+    "head_center_x",
+    "head_center_y",
+    "head_scale",
+)
+
+# Modes B/C, 2D pupil pipeline: pupil centre in the normalised eye-camera image. Same layout
+# as Mode A, but the pupil coordinates come from a different image, so models never transfer.
+FEATURE_NAMES_PUPIL_2D: tuple[str, ...] = FEATURE_NAMES_MODE_A
+
+# Modes B/C, 3D eye-model pipeline: unit gaze vector in eye-camera coordinates.
+FEATURE_NAMES_EYE_3D: tuple[str, ...] = (
+    "left_gaze_x",
+    "left_gaze_y",
+    "left_gaze_z",
+    "left_gaze_conf",
+    "right_gaze_x",
+    "right_gaze_y",
+    "right_gaze_z",
+    "right_gaze_conf",
+    *_HEAD_NAMES,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureLayout:
+    """Where each eye's values, each eye's confidence, and the head pose live in a vector."""
+
+    names: tuple[str, ...]
+    eye_values: dict[str, tuple[int, ...]]  # "left"/"right" -> value columns (no confidence)
+    eye_conf: dict[str, int]
+    head: tuple[int, ...]  # yaw, pitch, roll, center x, center y, scale
+    eye_kind: Literal["position", "direction"]
+
+    @property
+    def width(self) -> int:
+        return len(self.names)
+
+
+_LAYOUT_2D = FeatureLayout(
+    names=FEATURE_NAMES_PUPIL_2D,
+    eye_values={"left": (0, 1), "right": (3, 4)},
+    eye_conf={"left": 2, "right": 5},
+    head=tuple(range(6, 12)),
+    eye_kind="position",
+)
+_LAYOUT_3D = FeatureLayout(
+    names=FEATURE_NAMES_EYE_3D,
+    eye_values={"left": (0, 1, 2), "right": (4, 5, 6)},
+    eye_conf={"left": 3, "right": 7},
+    head=tuple(range(8, 14)),
+    eye_kind="direction",
+)
+
+FEATURE_LAYOUTS: dict[str, FeatureLayout] = {
+    "A-webcam": _LAYOUT_2D,
+    "B-pupil2d": _LAYOUT_2D,
+    "C-pupil2d": _LAYOUT_2D,
+    "B-eye3d": _LAYOUT_3D,
+    "C-eye3d": _LAYOUT_3D,
+}
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class FeatureVector:
     """Fixed-length feature sample ready for a calibration or gaze model.
@@ -80,7 +150,7 @@ class FeatureVector:
     t_ns: int
     values: np.ndarray  # float32[N]
     valid: np.ndarray   # bool[N]
-    schema_id: Literal["A-webcam", "B-single-eye", "C-dual-eye"]
+    schema_id: SchemaId
     max_skew_ns: int    # time gap between the newest and oldest contributing observation
     head_t_ns: int | None
     left_eye_t_ns: int | None

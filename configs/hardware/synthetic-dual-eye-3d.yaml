@@ -1,0 +1,49 @@
+# Fully simulated Mode C rig for the 3D eye-model pipeline: two eye cameras rendering a
+# rotating eyeball (the pupil foreshortens into an ellipse), plus a head camera.
+# Everything from this profile is labeled SYNTHETIC in the UI and in every CameraFrame.
+hardware_profile:
+  id: synthetic-dual-eye-3d
+  version: 1
+  frame_design: simulated
+
+  cameras:
+    left_eye:
+      source_type: synthetic
+      resolution: [320, 240]
+      fps: 60
+      mounting_position: below_eye
+      options:
+        pattern: eye
+        eye_model: spherical
+        motion: saccades
+        motion_seed: 7
+        noise_seed: 1
+
+    right_eye:
+      source_type: synthetic
+      resolution: [320, 240]
+      fps: 60
+      mounting_position: below_eye
+      options:
+        pattern: eye
+        eye_model: spherical
+        motion: saccades
+        motion_seed: 7
+        noise_seed: 2
+
+    head:
+      source_type: synthetic
+      resolution: [640, 360]
+      fps: 30
+      mounting_position: display_top
+      options:
+        pattern: test_card
+
+  gaze:
+    pipeline: eye_3d             # 2D pupil detector → 3D eye model → gaze vector
+    detector_2d: {type: ellipse_fit}
+    eye_model_3d: {type: sphere_fit}
+
+  calibration:
+    screen_mapping: per_user
+    geometry_estimation: geometric   # ray–screen-plane intersection with head-pose rotation

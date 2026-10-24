@@ -1,12 +1,15 @@
 """Gaze test environment: fullscreen window showing gaze dot, camera feed, blink state.
 
+Works in every tracking mode (A webcam, B/C eye cameras) through ``GazeTracker``.
+
 Flow
 ----
 1. If no calibration: run calibration wizard first, then return here.
 2. Fullscreen window opens.
 3. Gaze dot tracks eye position.
-4. Long blink (both eyes >= 400 ms) fires a click.
-5. Tab toggles real cursor control on/off.
+4. Eye gestures (blinks, winks, glances) fire their keybinds from ``gestures:`` in the app
+   config; the default binds a long blink to a click.
+5. Tab toggles real cursor control on/off (key/mouse bindings only act while it's on).
 6. C re-runs calibration.
 7. Space pauses/resumes.
 8. Escape quits.
@@ -21,23 +24,19 @@ import time
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
-from opengaze.calibration.session import GRID_9, GRID_LO, GRID_HI
 from opengaze.calibration.storage import CalibrationStore
 from opengaze.cameras.manager import CameraManager
 from opengaze.cameras.runtime import CaptureRuntime
-from opengaze.cameras.types import CameraRole, SourceKind
 from opengaze.config.loader import ProfileReport
 from opengaze.config.schema import AppConfig
-from opengaze.control.blink import BlinkClickDetector
-from opengaze.control.filter import OneEuroFilter
-from opengaze.control.safety import ConfidenceGate
-from opengaze.modes import TrackingMode, infer_mode
-from opengaze.vision.feature_extractor import build_mode_a
-from opengaze.vision.observations import EyeObservation, HeadObservation
-from opengaze.vision.preprocessing import FrameNormalizer
+from opengaze.gaze.loop import GazeLoop
+from opengaze.gaze.tracker import GazeTracker
+from opengaze.gestures.bindings import ActionDispatcher
+from opengaze.gestures.types import Gesture
+from opengaze.modes import profile_schema
 
 log = logging.getLogger("opengaze.run_ui")
 
@@ -52,17 +51,7 @@ _DIM = QColor("#555")
 _CURSOR_ON = QColor("#2e9e5b")
 _CURSOR_OFF = QColor("#555")
 
-_SCHEMA_MAP = {
-    TrackingMode.WEBCAM_ONLY: "A-webcam",
-    TrackingMode.SINGLE_EYE: "B-single-eye",
-    TrackingMode.DUAL_EYE: "C-dual-eye",
-}
-
 _POLL_MS = 33   # ~30 fps
-
-def _expand(v: float) -> float:
-    """Remap calibration output range [GRID_LO, GRID_HI] → [0, 1]."""
-    return max(0.0, min(1.0, (v - GRID_LO) / (GRID_HI - GRID_LO)))
 
 
 def _to_qimage(image: np.ndarray) -> QImage:
@@ -88,28 +77,32 @@ class GazeTestWindow(QWidget):
         self.config = config
         self.schema_id = schema_id
 
-        # Vision pipeline
-        self.normalizer = FrameNormalizer()
-        self._detector = _make_detector(config)
-        self._head_ids = {
-            cid for cid, cam in report.profile.enabled_cameras.items()
-            if cam.role is CameraRole.HEAD
-        }
+        # Vision pipeline (Mode A, B or C, per the profile)
+        self._tracker = GazeTracker(report.profile, config)
+        self._loop = GazeLoop(self._tracker, None, config.gestures)
 
-        # Load calibration model
+        # Load calibration model (and frozen eye-model state, for the 3D pipeline)
         self._store = CalibrationStore()
         self._model = None
         self._load_model()
 
-        # Gaze pipeline
-        self._filter_x = OneEuroFilter(min_cutoff=0.8, beta=0.07)
-        self._filter_y = OneEuroFilter(min_cutoff=0.8, beta=0.07)
-        self._conf_gate = ConfidenceGate(min_confidence=0.25)
-        self._blink = BlinkClickDetector(long_blink_ms=400, short_blink_ms=180)
-
-        # Cursor driver (optional)
+        # Cursor driver (optional); it is also the system input backend for keybinds
         self._cursor = _try_make_cursor()
         self._cursor_enabled = False  # off by default — toggle with Tab
+        self._dispatcher = ActionDispatcher(
+            config.gestures.bindings,
+            self._cursor,
+            {
+                "pause": self._toggle_pause,
+                "toggle_cursor": self._toggle_cursor,
+                "recalibrate": lambda: QTimer.singleShot(0, self._run_calibration),
+                "keyboard": lambda: QTimer.singleShot(0, lambda: self._open_activity("keyboard")),
+                "practice": lambda: QTimer.singleShot(0, lambda: self._open_activity("practice")),
+                "quit": lambda: QTimer.singleShot(0, self.close),
+            },
+        )
+        self._last_gesture: str = ""
+        self._last_gesture_until: float = 0.0
 
         # Display state
         self._gaze_x: float = 0.5
@@ -121,8 +114,6 @@ class GazeTestWindow(QWidget):
         self._paused = False
         self._click_flash_until: float = 0.0
         self._camera_frame: np.ndarray | None = None
-        self._eyes: list[EyeObservation] = []
-        self._head: HeadObservation | None = None
         self._clicks = 0
         self._status = "Press C to calibrate, Tab to enable cursor, Space to pause, Esc to quit"
 
@@ -142,9 +133,13 @@ class GazeTestWindow(QWidget):
 
     def _load_model(self) -> None:
         try:
-            self._model = self._store.load(self.schema_id, self.profile)  # type: ignore[arg-type]
+            bundle = self._store.load_bundle(self.schema_id, self.profile)  # type: ignore[arg-type]
         except (FileNotFoundError, ValueError):
             self._model = None
+        else:
+            self._model = bundle.model
+            self._tracker.load_eye_states(bundle.eye_states)
+        self._loop.model = self._model
 
     # ------------------------------------------------------------------
     # Timer tick
@@ -152,76 +147,55 @@ class GazeTestWindow(QWidget):
 
     def _tick(self) -> None:
         if self._paused:
+            # Keep gestures alive so an app binding (e.g. pause) can un-pause hands-free.
+            state = self._loop.tick(self.runtime.manager)
+            self._handle_gestures(state)
             self.update()
             return
 
-        frame_image = None
-        for cid in self._head_ids:
-            frame = self.runtime.manager.latest(cid)
-            if frame is None:
-                continue
-            frame = self.normalizer(frame)
-            frame_image = frame.image
+        state = self._loop.tick(self.runtime.manager)
+        frame = state.frame
+        self._camera_frame = _preview(frame)
+        self._left_blink = bool(frame.left_closed)
+        self._right_blink = bool(frame.right_closed)
+        self._blink_progress = max(state.gesture.blink_progress, state.gesture.wink_progress)
+        self._gaze_x, self._gaze_y = state.gaze_x, state.gaze_y
+        self._confidence = state.confidence
 
-            if self._detector is None:
-                continue
-            try:
-                head, eyes = self._detector.detect(frame)
-            except Exception:
-                continue
+        if state.updated and self._cursor_enabled and self._cursor:
+            px, py = self._cursor.norm_to_px(self._gaze_x, self._gaze_y)
+            self._cursor.move(px, py)
 
-            self._head = head
-            self._eyes = eyes
+        self._handle_gestures(state)
+        self.update()
 
-            # Iris overlay on camera image
-            if frame_image is not None:
-                frame_image = _draw_iris(frame_image, eyes)
-
-            # Blink state
-            left_eye = next((e for e in eyes if e.eye == "left"), None)
-            right_eye = next((e for e in eyes if e.eye == "right"), None)
-            self._left_blink = bool(left_eye and left_eye.blink)
-            self._right_blink = bool(right_eye and right_eye.blink)
-
-            blink_result = self._blink.update(self._left_blink, self._right_blink)
-            self._blink_progress = blink_result.blink_progress
-
-            if self._model is None:
-                continue
-
-            # Freeze gaze while eyes are closed — iris position is unreliable
-            # during a blink.  The filter also skips blinking frames so it
-            # doesn't drift, and the click fires at the frozen pre-blink position.
-            if not blink_result.any_blink:
-                fv = build_mode_a(head, left_eye, right_eye)
-
-                if not self._conf_gate.allow(fv.valid.mean()):
-                    continue
-
-                try:
-                    sample = self._model.predict(fv)
-                except Exception:
-                    continue
-
-                self._confidence = sample.confidence
-                t = time.monotonic()
-                self._gaze_x = _expand(self._filter_x(sample.screen_x_norm, t))
-                self._gaze_y = _expand(self._filter_y(sample.screen_y_norm, t))
-
-                if self._cursor_enabled and self._cursor:
-                    px, py = self._cursor.norm_to_px(self._gaze_x, self._gaze_y)
-                    self._cursor.move(px, py)
-
-            # Long blink → click at the frozen pre-blink position
-            if blink_result.clicked:
+    def _handle_gestures(self, state) -> None:
+        """Dispatch gesture events at the frozen pre-blink gaze position."""
+        self._dispatcher.system_input_enabled = (
+            self._cursor_enabled and not self._paused and self._model is not None
+        )
+        gaze_px = self._cursor.norm_to_px(self._gaze_x, self._gaze_y) if self._cursor else None
+        for event in state.gesture.events:
+            result = self._dispatcher.dispatch(event, gaze_px)
+            binding = result.binding.describe() if result.binding else "unbound"
+            self._last_gesture = f"{event.gesture.value} → {binding} ({result.outcome})"
+            self._last_gesture_until = time.monotonic() + 1.5
+            is_click = (
+                result.binding.mouse == "click"
+                if result.binding is not None
+                else event.gesture is Gesture.LONG_BLINK
+            )
+            if is_click:
                 self._clicks += 1
                 self._click_flash_until = time.monotonic() + 0.3
-                if self._cursor_enabled and self._cursor:
-                    px, py = self._cursor.norm_to_px(self._gaze_x, self._gaze_y)
-                    self._cursor.click(px, py)
 
-        self._camera_frame = frame_image
-        self.update()
+    def _toggle_pause(self) -> None:
+        self._paused = not self._paused
+        self._loop.reset()
+
+    def _toggle_cursor(self) -> None:
+        self._cursor_enabled = not self._cursor_enabled
+        self._status = f"Cursor control {'ON' if self._cursor_enabled else 'OFF'}"
 
     # ------------------------------------------------------------------
     # Input
@@ -232,14 +206,9 @@ class GazeTestWindow(QWidget):
         if k == Qt.Key.Key_Escape:
             self.close()
         elif k == Qt.Key.Key_Space:
-            self._paused = not self._paused
-            if not self._paused:
-                self._filter_x.reset()
-                self._filter_y.reset()
+            self._toggle_pause()
         elif k == Qt.Key.Key_Tab:
-            self._cursor_enabled = not self._cursor_enabled
-            state = "ON" if self._cursor_enabled else "OFF"
-            self._status = f"Cursor control {state}"
+            self._toggle_cursor()
         elif k == Qt.Key.Key_C:
             self._run_calibration()
         elif k == Qt.Key.Key_K:
@@ -260,14 +229,14 @@ class GazeTestWindow(QWidget):
                 win = GazeKeyboardWindow(
                     self.runtime, _make_report(self.profile),
                     self.config, self.schema_id, self._model,
-                    detector=self._detector,
+                    tracker=self._tracker,
                 )
             else:
                 from opengaze.desktop.practice_ui import PracticeWindow
                 win = PracticeWindow(
                     self.runtime, _make_report(self.profile),
                     self.config, self.schema_id, self._model,
-                    detector=self._detector,
+                    tracker=self._tracker,
                 )
             win.show()
             app = QApplication.instance()
@@ -276,15 +245,17 @@ class GazeTestWindow(QWidget):
                 time.sleep(0.03)
         except Exception as exc:
             log.warning("%s activity failed: %s", kind, exc)
-        self._filter_x.reset()
-        self._filter_y.reset()
+        self._loop.reset()
         self._timer.start()
 
     def _run_calibration(self) -> None:
         self._timer.stop()
         try:
             from opengaze.desktop.calibration_ui import CalibrationWindow
-            win = CalibrationWindow(self.runtime, _make_report(self.profile), self.config, self._store, owns_runtime=False)
+            win = CalibrationWindow(
+                self.runtime, _make_report(self.profile), self.config, self._store,
+                owns_runtime=False, tracker=self._tracker,
+            )
             win.show()
             # Wait for it to close
             app = QApplication.instance()
@@ -294,8 +265,7 @@ class GazeTestWindow(QWidget):
         except Exception as exc:
             log.warning("calibration failed: %s", exc)
         self._load_model()
-        self._filter_x.reset()
-        self._filter_y.reset()
+        self._loop.reset()
         self._timer.start()
 
     # ------------------------------------------------------------------
@@ -310,6 +280,9 @@ class GazeTestWindow(QWidget):
 
         if self._paused:
             self._draw_centered(p, "PAUSED — press Space to resume", w // 2, h // 2)
+            if time.monotonic() < self._last_gesture_until:
+                p.setPen(QColor("#f0b429"))
+                p.drawText(16, 52, f"gesture: {self._last_gesture}")
             p.end()
             return
 
@@ -410,10 +383,10 @@ class GazeTestWindow(QWidget):
 
         # Bottom bar
         p.drawText(16, h - 16, "C=calibrate  K=keyboard  G=practice  Tab=cursor  Space=pause  Esc=quit")
-        if self._status != self._status:
-            pass
         p.setPen(QColor("#f0b429"))
         p.drawText(16, h - 36, self._status)
+        if time.monotonic() < self._last_gesture_until:
+            p.drawText(16, 52, f"gesture: {self._last_gesture}")
 
         # Long blink hint
         if self._blink_progress > 0.05:
@@ -436,8 +409,7 @@ class GazeTestWindow(QWidget):
     def closeEvent(self, event) -> None:  # noqa: N802
         self._timer.stop()
         self.runtime.stop()
-        if self._detector is not None:
-            self._detector.close()
+        self._tracker.close()
         super().closeEvent(event)
 
 
@@ -445,38 +417,14 @@ class GazeTestWindow(QWidget):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _draw_iris(image: np.ndarray, eyes: list[EyeObservation]) -> np.ndarray:
+def _preview(frame) -> np.ndarray | None:
+    """Head camera image, or the eye-camera images side by side (Modes B/C)."""
+    eyes = [frame.eye_images[s] for s in ("left", "right") if s in frame.eye_images]
     if not eyes:
-        return image
-    image = image.copy()
-    h, w = image.shape[:2]
-    for eye in eyes:
-        if eye.blink:
-            continue
-        cx = round(eye.pupil_x_norm * w)
-        cy = round(eye.pupil_y_norm * h)
-        r = max(4, round(eye.pupil_radius_norm * min(w, h)))
-        cv2.circle(image, (cx, cy), r, (80, 200, 255), 2, cv2.LINE_AA)
-        cv2.drawMarker(image, (cx, cy), (80, 200, 255), cv2.MARKER_CROSS, 8, 1, cv2.LINE_AA)
-    return image
-
-
-def _make_detector(config: AppConfig) -> object | None:
-    if not config.vision.enable_face_tracking:
-        return None
-    try:
-        from opengaze.vision.mediapipe_detector import FaceLandmarkDetector, default_model_path
-        path = config.vision.face_landmarker_model_path or default_model_path()
-        if not path.exists():
-            log.warning("MediaPipe model not found — run 'opengaze download-models'")
-            return None
-        return FaceLandmarkDetector(path)
-    except ImportError:
-        log.warning("mediapipe not installed")
-        return None
-    except Exception as exc:
-        log.error("could not create detector: %s", exc)
-        return None
+        return frame.head_image
+    h = min(img.shape[0] for img in eyes)
+    tiles = [cv2.resize(img, (round(img.shape[1] * h / img.shape[0]), h)) for img in eyes]
+    return np.hstack(tiles)
 
 
 def _try_make_cursor() -> object | None:
@@ -502,8 +450,7 @@ def run_gaze_test(report: ProfileReport, config: AppConfig) -> int:
     assert report.profile is not None
     app = QApplication.instance() or QApplication(sys.argv[:1])
 
-    mode = infer_mode({cam.role for cam in report.profile.enabled_cameras.values()})
-    schema_id = _SCHEMA_MAP.get(mode, "A-webcam")
+    schema_id = profile_schema(report.profile)
 
     # Start runtime once — shared between calibration and gaze test so the camera
     # stays on continuously (no pause/restart between phases).

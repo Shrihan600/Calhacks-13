@@ -17,15 +17,11 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QKeyEvent, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
-from opengaze.cameras.types import CameraRole
 from opengaze.cameras.runtime import CaptureRuntime
 from opengaze.config.loader import ProfileReport
 from opengaze.config.schema import AppConfig
-from opengaze.control.blink import BlinkClickDetector
-from opengaze.control.filter import OneEuroFilter
-from opengaze.control.safety import ConfidenceGate
-from opengaze.vision.feature_extractor import build_mode_a
-from opengaze.vision.preprocessing import FrameNormalizer
+from opengaze.gaze.loop import GazeLoop, clicked
+from opengaze.gaze.tracker import GazeTracker
 
 log = logging.getLogger("opengaze.practice_ui")
 
@@ -69,28 +65,16 @@ class PracticeWindow(QWidget):
         config: AppConfig,
         schema_id: str,
         model: object,
-        detector: object | None = None,
+        tracker: GazeTracker | None = None,
     ) -> None:
         super().__init__()
         assert report.profile is not None
         self._runtime = runtime
         self._model = model
-        self._head_ids = {
-            cid for cid, cam in report.profile.enabled_cameras.items()
-            if cam.role is CameraRole.HEAD
-        }
-        self._normalizer = FrameNormalizer()
-        if detector is not None:
-            self._detector = detector
-            self._owns_detector = False
-        else:
-            self._detector = _make_detector(config)
-            self._owns_detector = True
-
-        self._fx = OneEuroFilter(min_cutoff=0.8, beta=0.07)
-        self._fy = OneEuroFilter(min_cutoff=0.8, beta=0.07)
-        self._conf = ConfidenceGate(min_confidence=0.25)
-        self._blink = BlinkClickDetector(long_blink_ms=400)
+        self._owns_tracker = tracker is None
+        self._tracker = tracker or GazeTracker(report.profile, config)
+        self._gestures = config.gestures
+        self._loop = GazeLoop(self._tracker, model, config.gestures)  # type: ignore[arg-type]
 
         self._gaze_x: float = 0.5
         self._gaze_y: float = 0.5
@@ -151,39 +135,13 @@ class PracticeWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _tick(self) -> None:
-        for cid in self._head_ids:
-            frame = self._runtime.manager.latest(cid)
-            if frame is None:
-                continue
-            frame = self._normalizer(frame)
-            if self._detector is None:
-                continue
-            try:
-                head, eyes = self._detector.detect(frame)
-            except Exception:
-                continue
+        st = self._loop.tick(self._runtime.manager)
+        self._blink_prog = st.gesture.blink_progress
+        self._gaze_x, self._gaze_y = st.gaze_x, st.gaze_y
+        click = clicked(st, self._gestures)
 
-            left_eye  = next((e for e in eyes if e.eye == "left"),  None)
-            right_eye = next((e for e in eyes if e.eye == "right"), None)
-            br = self._blink.update(
-                bool(left_eye  and left_eye.blink),
-                bool(right_eye and right_eye.blink),
-            )
-            self._blink_prog = br.blink_progress
-
-            if self._model is not None and not br.any_blink:
-                fv = build_mode_a(head, left_eye, right_eye)
-                if self._conf.allow(fv.valid.mean()):
-                    try:
-                        s = self._model.predict(fv)
-                        t = time.monotonic()
-                        self._gaze_x = max(0.0, min(1.0, (self._fx(s.screen_x_norm, t) - 0.05) / 0.90))
-                        self._gaze_y = max(0.0, min(1.0, (self._fy(s.screen_y_norm, t) - 0.05) / 0.90))
-                    except Exception:
-                        pass
-
-            if br.clicked and self._state == "playing":
-                self._on_click()
+        if click and self._state == "playing":
+            self._on_click()
 
         now = time.monotonic()
         if self._state == "playing":
@@ -305,17 +263,7 @@ class PracticeWindow(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._timer.stop()
-        if self._owns_detector and self._detector is not None:
-            self._detector.close()
+        if self._owns_tracker:
+            self._tracker.close()
         super().closeEvent(event)
 
-
-def _make_detector(config: AppConfig) -> object | None:
-    try:
-        from opengaze.vision.mediapipe_detector import FaceLandmarkDetector, default_model_path
-        path = config.vision.face_landmarker_model_path or default_model_path()
-        if path.exists():
-            return FaceLandmarkDetector(path)
-    except Exception:
-        pass
-    return None
