@@ -29,7 +29,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class CartesiaError(RuntimeError):
-    pass
+    def __init__(self, message: str, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def read_dotenv(path: Path) -> dict[str, str]:
@@ -104,12 +106,32 @@ def _multipart(fields: dict[str, str], file_name: str, file_bytes: bytes,
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
+def _error_message(code: int, raw: bytes) -> str:
+    """Cartesia-Version 2026-03-01+ errors are JSON with ``title``/``message``."""
+    try:
+        err = json.loads(raw)
+        return f"HTTP {code}: {err.get('message') or err.get('title')}"
+    except (ValueError, AttributeError):
+        return f"HTTP {code}: {raw[:200].decode(errors='replace').strip()}"
+
+
 class CartesiaClient:
-    def __init__(self, config: CartesiaConfig, timeout_s: float = 20.0) -> None:
+    def __init__(self, config: CartesiaConfig, timeout_s: float = 10.0, retries: int = 1) -> None:
         self.config = config
         self.timeout_s = timeout_s
+        self.retries = retries
 
     def _post(self, path: str, body: bytes, content_type: str) -> bytes:
+        """POST with one retry on network errors and 5xx (seen: occasional STT stalls)."""
+        for attempt in range(self.retries + 1):
+            try:
+                return self._post_once(path, body, content_type)
+            except CartesiaError as exc:
+                if not exc.retryable or attempt == self.retries:
+                    raise
+        raise AssertionError("unreachable")
+
+    def _post_once(self, path: str, body: bytes, content_type: str) -> bytes:
         req = urllib.request.Request(
             API_BASE + path,
             data=body,
@@ -124,10 +146,11 @@ class CartesiaClient:
             with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
                 return resp.read()
         except urllib.error.HTTPError as exc:
-            detail = exc.read()[:200].decode(errors="replace").strip()
-            raise CartesiaError(f"HTTP {exc.code}: {detail}") from exc
+            raise CartesiaError(
+                _error_message(exc.code, exc.read()), retryable=exc.code >= 500,
+            ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise CartesiaError(f"network error: {exc}") from exc
+            raise CartesiaError(f"network error: {exc}", retryable=True) from exc
 
     def transcribe(self, pcm16: bytes, sample_rate: int) -> str:
         """Speech → text with Ink-Whisper. ``pcm16`` is mono signed 16-bit LE."""

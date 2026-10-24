@@ -228,3 +228,32 @@ def test_cancel_drops_inflight_transcript(monkeypatch):
     svc.cancel()
     time.sleep(0.3)
     assert svc.poll() == []
+
+
+def test_retries_once_on_timeout(monkeypatch):
+    calls = []
+
+    def flaky(req, timeout):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError("stalled")
+        return _FakeResp(json.dumps({"type": "transcript", "text": "ok"}).encode())
+
+    monkeypatch.setattr(cartesia.urllib.request, "urlopen", flaky)
+    assert CartesiaClient(CartesiaConfig(api_key="k")).transcribe(b"\0\0" * 160, 16000) == "ok"
+    assert len(calls) == 2
+
+
+def test_client_error_not_retried_and_message_parsed(monkeypatch):
+    calls = []
+
+    def unauthorized(req, timeout):
+        calls.append(1)
+        body = json.dumps({"error_code": None, "title": "Unauthorized",
+                           "message": "Invalid API key.", "request_id": "x"}).encode()
+        raise cartesia.urllib.error.HTTPError(req.full_url, 401, "", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(cartesia.urllib.request, "urlopen", unauthorized)
+    with pytest.raises(CartesiaError, match="HTTP 401: Invalid API key."):
+        CartesiaClient(CartesiaConfig(api_key="k")).synthesize("hi")
+    assert len(calls) == 1

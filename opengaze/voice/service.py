@@ -219,6 +219,8 @@ class VoiceService:
                 self._say_proc = None
                 self._speak_until = 0.0
                 self._state = VoiceState.IDLE
+                if self.status.startswith("Speaking"):
+                    self.status = f"Voice: {self.engine} — ready"
         with self._lock:
             out = list(self._transcripts)
             self._transcripts.clear()
