@@ -24,7 +24,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QWidget
 
-from opengaze.calibration.session import GRID_9
+from opengaze.calibration.session import GRID_9, GRID_LO, GRID_HI
 from opengaze.calibration.storage import CalibrationStore
 from opengaze.cameras.manager import CameraManager
 from opengaze.cameras.runtime import CaptureRuntime
@@ -59,6 +59,10 @@ _SCHEMA_MAP = {
 }
 
 _POLL_MS = 33   # ~30 fps
+
+def _expand(v: float) -> float:
+    """Remap calibration output range [GRID_LO, GRID_HI] → [0, 1]."""
+    return max(0.0, min(1.0, (v - GRID_LO) / (GRID_HI - GRID_LO)))
 
 
 def _to_qimage(image: np.ndarray) -> QImage:
@@ -201,8 +205,8 @@ class GazeTestWindow(QWidget):
 
                 self._confidence = sample.confidence
                 t = time.monotonic()
-                self._gaze_x = self._filter_x(sample.screen_x_norm, t)
-                self._gaze_y = self._filter_y(sample.screen_y_norm, t)
+                self._gaze_x = _expand(self._filter_x(sample.screen_x_norm, t))
+                self._gaze_y = _expand(self._filter_y(sample.screen_y_norm, t))
 
                 if self._cursor_enabled and self._cursor:
                     px, py = self._cursor.norm_to_px(self._gaze_x, self._gaze_y)

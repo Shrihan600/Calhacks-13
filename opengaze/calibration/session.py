@@ -18,10 +18,14 @@ from opengaze.vision.observations import FeatureVector
 
 # Default 9-point grid: (x_norm, y_norm) covering the screen evenly.
 GRID_9: tuple[tuple[float, float], ...] = (
-    (0.1, 0.1), (0.5, 0.1), (0.9, 0.1),
-    (0.1, 0.5), (0.5, 0.5), (0.9, 0.5),
-    (0.1, 0.9), (0.5, 0.9), (0.9, 0.9),
+    (0.05, 0.05), (0.5, 0.05), (0.95, 0.05),
+    (0.05, 0.5),  (0.5, 0.5),  (0.95, 0.5),
+    (0.05, 0.95), (0.5, 0.95), (0.95, 0.95),
 )
+
+# Calibration grid min/max used to remap model output to full [0,1] screen range.
+GRID_LO: float = 0.05
+GRID_HI: float = 0.95
 
 
 @dataclass

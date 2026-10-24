@@ -177,8 +177,8 @@ class PracticeWindow(QWidget):
                     try:
                         s = self._model.predict(fv)
                         t = time.monotonic()
-                        self._gaze_x = self._fx(s.screen_x_norm, t)
-                        self._gaze_y = self._fy(s.screen_y_norm, t)
+                        self._gaze_x = max(0.0, min(1.0, (self._fx(s.screen_x_norm, t) - 0.05) / 0.90))
+                        self._gaze_y = max(0.0, min(1.0, (self._fy(s.screen_y_norm, t) - 0.05) / 0.90))
                     except Exception:
                         pass
 

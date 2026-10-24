@@ -8,6 +8,7 @@ the gaze test window.
 from __future__ import annotations
 
 import logging
+import math
 import subprocess
 import time
 
@@ -36,6 +37,20 @@ ROWS: list[list[str]] = [
 _SPECIAL_W = {"SPACE": 4, "⌫": 2, "CLEAR": 2, "SPEAK": 2}
 _KEY_DWELL_S = 0.8
 _KEY_COOL_S = 0.5
+
+def _expand(v: float, lo: float = 0.05, hi: float = 0.95) -> float:
+    return max(0.0, min(1.0, (v - lo) / (hi - lo)))
+
+def _nearest_key(rects: dict[str, QRect], gx: int, gy: int, kb_top: int) -> str | None:
+    """Return the key whose centre is closest to (gx, gy), or None if above keyboard."""
+    if gy < kb_top - 30:
+        return None
+    best, best_d = None, float("inf")
+    for key, rect in rects.items():
+        d = math.hypot(gx - rect.center().x(), gy - rect.center().y())
+        if d < best_d:
+            best_d, best = d, key
+    return best
 
 _BG         = QColor("#0d0f12")
 _TEXT_BG    = QColor("#080a0d")
@@ -163,15 +178,16 @@ class GazeKeyboardWindow(QWidget):
                     try:
                         s = self._model.predict(fv)
                         t = time.monotonic()
-                        self._gaze_x = self._fx(s.screen_x_norm, t)
-                        self._gaze_y = self._fy(s.screen_y_norm, t)
+                        self._gaze_x = _expand(self._fx(s.screen_x_norm, t))
+                        self._gaze_y = _expand(self._fy(s.screen_y_norm, t))
                     except Exception:
                         pass
 
             w, h = self.width(), self.height()
             gx = int(self._gaze_x * w)
             gy = int(self._gaze_y * h)
-            hovered = next((k for k, r in self._rects.items() if r.contains(gx, gy)), None)
+            kb_top = int(h * 0.32)
+            hovered = _nearest_key(self._rects, gx, gy, kb_top)
 
             now = time.monotonic()
             in_cool = now < self._cool_until
