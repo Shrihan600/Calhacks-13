@@ -185,34 +185,35 @@ class GazeTestWindow(QWidget):
             if self._model is None:
                 continue
 
-            fv = build_mode_a(head, left_eye, right_eye)
+            # Freeze gaze while eyes are closed — iris position is unreliable
+            # during a blink.  The filter also skips blinking frames so it
+            # doesn't drift, and the click fires at the frozen pre-blink position.
+            if not blink_result.any_blink:
+                fv = build_mode_a(head, left_eye, right_eye)
 
-            if not self._conf_gate.allow(fv.valid.mean()):
-                continue
+                if not self._conf_gate.allow(fv.valid.mean()):
+                    continue
 
-            try:
-                sample = self._model.predict(fv)
-            except Exception:
-                continue
+                try:
+                    sample = self._model.predict(fv)
+                except Exception:
+                    continue
 
-            self._confidence = sample.confidence
-            t = time.monotonic()
-            sx = self._filter_x(sample.screen_x_norm, t)
-            sy = self._filter_y(sample.screen_y_norm, t)
-            self._gaze_x = sx
-            self._gaze_y = sy
+                self._confidence = sample.confidence
+                t = time.monotonic()
+                self._gaze_x = self._filter_x(sample.screen_x_norm, t)
+                self._gaze_y = self._filter_y(sample.screen_y_norm, t)
 
-            # Pause cursor during any blink (avoid drift)
-            if not blink_result.any_blink and self._cursor_enabled and self._cursor:
-                px, py = self._cursor.norm_to_px(sx, sy)
-                self._cursor.move(px, py)
+                if self._cursor_enabled and self._cursor:
+                    px, py = self._cursor.norm_to_px(self._gaze_x, self._gaze_y)
+                    self._cursor.move(px, py)
 
-            # Long blink → click
+            # Long blink → click at the frozen pre-blink position
             if blink_result.clicked:
                 self._clicks += 1
                 self._click_flash_until = time.monotonic() + 0.3
                 if self._cursor_enabled and self._cursor:
-                    px, py = self._cursor.norm_to_px(sx, sy)
+                    px, py = self._cursor.norm_to_px(self._gaze_x, self._gaze_y)
                     self._cursor.click(px, py)
 
         self._camera_frame = frame_image
