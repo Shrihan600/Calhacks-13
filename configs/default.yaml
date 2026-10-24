@@ -15,6 +15,13 @@ diagnostics:
   # Show frames after rotation/mirror/crop from the hardware profile (false = raw sensor image).
   show_normalized: true
 
+vision:
+  # Path to the MediaPipe FaceLandmarker .task model file.
+  # Leave null to use ~/.cache/opengaze/face_landmarker.task (downloaded automatically on first run).
+  # Run `opengaze download-models` to pre-fetch it.
+  face_landmarker_model_path: null
+  enable_face_tracking: true
+
 privacy:
   # Recording camera video to disk is off unless explicitly enabled AND consented to in the UI.
   allow_recording: false

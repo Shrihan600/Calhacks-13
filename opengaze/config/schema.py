@@ -196,6 +196,14 @@ class DiagnosticsSettings(_Model):
     show_normalized: bool = True
 
 
+class VisionSettings(_Model):
+    # Path to the MediaPipe FaceLandmarker model file.
+    # None = use ~/.cache/opengaze/face_landmarker.task (downloaded automatically).
+    face_landmarker_model_path: Path | None = None
+    # Set to False to skip MediaPipe even when installed (useful for headless CI).
+    enable_face_tracking: bool = True
+
+
 class PrivacySettings(_Model):
     allow_recording: bool = False
     cloud_features_enabled: bool = False
@@ -205,4 +213,5 @@ class AppConfig(_Model):
     app: AppSection
     capture: CaptureSettings = CaptureSettings()
     diagnostics: DiagnosticsSettings = DiagnosticsSettings()
+    vision: VisionSettings = VisionSettings()
     privacy: PrivacySettings = PrivacySettings()

@@ -47,7 +47,10 @@ include = ["opengaze*"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-markers = ["hardware: needs a real camera; run with `pytest -m hardware`"]
+markers = [
+    "hardware: needs a real camera; run with `pytest -m hardware`",
+    "mediapipe: needs the face_landmarker.task model; run with `pytest -m mediapipe`",
+]
 addopts = "-m 'not hardware'"
 
 [tool.ruff]

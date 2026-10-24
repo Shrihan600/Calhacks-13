@@ -27,10 +27,11 @@ from PySide6.QtWidgets import (
 
 from opengaze.cameras.manager import CameraHealth, CameraManager
 from opengaze.cameras.runtime import CaptureRuntime
-from opengaze.cameras.types import CameraFrame, CameraState, ControlSupport, SourceKind
+from opengaze.cameras.types import CameraFrame, CameraRole, CameraState, ControlSupport, SourceKind
 from opengaze.config.fingerprint import profile_fingerprint
 from opengaze.config.loader import ProfileReport
 from opengaze.config.schema import AppConfig
+from opengaze.vision.observations import EyeObservation, HeadObservation
 from opengaze.vision.preprocessing import FrameNormalizer
 
 STATE_COLORS = {
@@ -102,10 +103,19 @@ class CameraTile(QFrame):
         self.notes.setObjectName("notes")
         self.notes.setWordWrap(True)
 
+        self.pose = QLabel()
+        mono = QFont("Menlo")
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        mono.setPointSize(11)
+        self.pose.setFont(mono)
+        self.pose.setStyleSheet("color: #60c8ff;")
+        self.pose.setVisible(False)
+
         layout = QVBoxLayout(self)
         layout.addLayout(header)
         layout.addWidget(self.preview, 1)
         layout.addWidget(self.stats)
+        layout.addWidget(self.pose)
         layout.addWidget(self.notes)
 
     def show_health(self, health: CameraHealth, frame: CameraFrame | None) -> None:
@@ -145,6 +155,20 @@ class CameraTile(QFrame):
         self.notes.setText("\n".join(notes))
         self.notes.setVisible(bool(notes))
 
+    def show_pose(self, head: HeadObservation | None, eyes: list[EyeObservation]) -> None:
+        if head is None:
+            self.pose.setVisible(False)
+            return
+        blinks = "".join(
+            ("L" if any(e.eye == "left" and e.blink for e in eyes) else "·")
+            + ("R" if any(e.eye == "right" and e.blink for e in eyes) else "·")
+        )
+        self.pose.setText(
+            f"yaw {head.yaw_deg:+6.1f}°  pitch {head.pitch_deg:+6.1f}°  "
+            f"roll {head.roll_deg:+6.1f}°  scale {head.relative_scale:.3f}  blink {blinks}"
+        )
+        self.pose.setVisible(True)
+
     def show_frame(self, image: np.ndarray) -> None:
         pixmap = QPixmap.fromImage(to_qimage(image))
         self.preview.setPixmap(
@@ -154,6 +178,25 @@ class CameraTile(QFrame):
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
+
+
+def draw_detections(
+    image: np.ndarray, eyes: list[EyeObservation]
+) -> np.ndarray:
+    """Overlay detected iris positions on the image (returns a copy)."""
+    if not eyes:
+        return image
+    image = image.copy()
+    h, w = image.shape[:2]
+    for eye in eyes:
+        if eye.blink:
+            continue
+        cx = round(eye.pupil_x_norm * w)
+        cy = round(eye.pupil_y_norm * h)
+        r = max(4, round(eye.pupil_radius_norm * min(w, h)))
+        cv2.circle(image, (cx, cy), r, (80, 200, 255), 2, cv2.LINE_AA)
+        cv2.drawMarker(image, (cx, cy), (80, 200, 255), cv2.MARKER_CROSS, 8, 1, cv2.LINE_AA)
+    return image
 
 
 def draw_ground_truth(frame: CameraFrame) -> np.ndarray:
@@ -185,6 +228,12 @@ class DiagnosticsWindow(QMainWindow):
         self.manager: CameraManager = runtime.manager
         self.profile = report.profile
         self.normalizer = FrameNormalizer()
+        self._detector = _try_create_detector(config)
+        self._head_camera_ids = {
+            cid
+            for cid, cam in report.profile.enabled_cameras.items()
+            if cam.role is CameraRole.HEAD
+        }
         self.setWindowTitle(f"OpenGaze diagnostics — {self.profile.id}")
         self.setStyleSheet(STYLE)
 
@@ -243,7 +292,19 @@ class DiagnosticsWindow(QMainWindow):
             if self.normalized.isChecked():
                 frame = self.normalizer(frame)
             show_truth = show_truth and frame.is_normalized
-            tile.show_frame(draw_ground_truth(frame) if show_truth else frame.image)
+
+            head: HeadObservation | None = None
+            eyes: list[EyeObservation] = []
+            if self._detector is not None and cid in self._head_camera_ids:
+                try:
+                    head, eyes = self._detector.detect(frame)
+                except Exception:
+                    pass
+
+            image = draw_ground_truth(frame) if show_truth else frame.image
+            image = draw_detections(image, eyes)
+            tile.show_frame(image)
+            tile.show_pose(head, eyes)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 (Qt naming)
         if event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_Q):
@@ -254,7 +315,33 @@ class DiagnosticsWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802
         self.timer.stop()
         self.runtime.stop()
+        if self._detector is not None:
+            self._detector.close()
         super().closeEvent(event)
+
+
+def _try_create_detector(config: AppConfig) -> object | None:
+    """Create a FaceLandmarkDetector if tracking is enabled and mediapipe is available."""
+    if not config.vision.enable_face_tracking:
+        return None
+    try:
+        from opengaze.vision.mediapipe_detector import FaceLandmarkDetector, default_model_path
+
+        model_path = config.vision.face_landmarker_model_path or default_model_path()
+        if not model_path.exists():
+            log.info(
+                "MediaPipe model not found at %s — run 'opengaze download-models' to enable "
+                "face tracking in the diagnostics window",
+                model_path,
+            )
+            return None
+        return FaceLandmarkDetector(model_path)
+    except ImportError:
+        log.debug("mediapipe not installed; face tracking disabled in diagnostics")
+        return None
+    except Exception as exc:
+        log.warning("could not create face landmark detector: %s", exc)
+        return None
 
 
 def run_diagnostics(report: ProfileReport, config: AppConfig) -> int:

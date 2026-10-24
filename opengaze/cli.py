@@ -162,6 +162,25 @@ def cmd_probe_cameras(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_download_models(args: argparse.Namespace) -> int:
+    """Download the MediaPipe FaceLandmarker model to the local cache."""
+    from opengaze.vision.mediapipe_detector import _MODEL_FILENAME, default_model_path, ensure_model
+
+    configure_logging(args.log_level or "INFO")
+    path = Path(args.output) if args.output else default_model_path()
+    if path.exists() and not args.force:
+        print(f"already present: {path}  ({path.stat().st_size / 1e6:.1f} MB)")
+        return 0
+    print(f"downloading {_MODEL_FILENAME} …")
+    try:
+        ensure_model(path)
+        print(f"saved to {path}  ({path.stat().st_size / 1e6:.1f} MB)")
+        return 0
+    except Exception as exc:
+        print(f"download failed: {exc}")
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="opengaze", description=__doc__)
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -195,6 +214,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("probe-cameras", help="list OpenCV camera indices that deliver frames")
     p.add_argument("--max-index", type=int, default=5)
     p.set_defaults(func=cmd_probe_cameras)
+
+    p = sub.add_parser("download-models", help="download the MediaPipe FaceLandmarker model")
+    p.add_argument("--output", help="save to this path instead of the default cache location")
+    p.add_argument("--force", action="store_true", help="re-download even if already present")
+    p.set_defaults(func=cmd_download_models)
+
     return parser
 
 
