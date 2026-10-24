@@ -88,6 +88,7 @@ class CalibrationWindow(QWidget):
         report: ProfileReport,
         config: AppConfig,
         store: CalibrationStore | None = None,
+        owns_runtime: bool = True,
     ) -> None:
         super().__init__()
         assert report.profile is not None
@@ -95,6 +96,7 @@ class CalibrationWindow(QWidget):
         self.profile = report.profile
         self.config = config
         self.store = store or CalibrationStore()
+        self._owns_runtime = owns_runtime
 
         # Vision pipeline
         self.normalizer = FrameNormalizer()
@@ -390,7 +392,8 @@ class CalibrationWindow(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._timer.stop()
-        self.runtime.stop()
+        if self._owns_runtime:
+            self.runtime.stop()
         if self._detector is not None:
             self._detector.close()
         super().closeEvent(event)

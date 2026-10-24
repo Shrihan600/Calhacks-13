@@ -250,8 +250,8 @@ class GazeTestWindow(QWidget):
         self._timer.stop()
         try:
             from opengaze.desktop.calibration_ui import CalibrationWindow
-            win = CalibrationWindow(self.runtime, _make_report(self.profile), self.config, self._store)
-            win.exec() if hasattr(win, "exec") else win.show()
+            win = CalibrationWindow(self.runtime, _make_report(self.profile), self.config, self._store, owns_runtime=False)
+            win.show()
             # Wait for it to close
             app = QApplication.instance()
             while win.isVisible():
@@ -472,19 +472,22 @@ def run_gaze_test(report: ProfileReport, config: AppConfig) -> int:
     mode = infer_mode({cam.role for cam in report.profile.enabled_cameras.values()})
     schema_id = _SCHEMA_MAP.get(mode, "A-webcam")
 
-    # Auto-calibrate if no calibration exists
+    # Start runtime once — shared between calibration and gaze test so the camera
+    # stays on continuously (no pause/restart between phases).
+    runtime = CaptureRuntime(CameraManager.from_profile(report.profile, config.capture))
+    runtime.start()
+
     store = CalibrationStore()
     if not store.exists(schema_id, report.profile):  # type: ignore[arg-type]
         print("No calibration found — running calibration first…")
-        from opengaze.desktop.calibration_ui import run_calibration
-        ret = run_calibration(report, config)
-        if ret != 0:
-            return ret
+        from opengaze.desktop.calibration_ui import CalibrationWindow
+        cal_win = CalibrationWindow(runtime, report, config, store, owns_runtime=False)
+        cal_win.show()
+        while cal_win.isVisible():
+            app.processEvents()
+            time.sleep(0.03)
         if not store.exists(schema_id, report.profile):  # type: ignore[arg-type]
             print("Calibration was not saved — continuing without a model.")
-
-    runtime = CaptureRuntime(CameraManager.from_profile(report.profile, config.capture))
-    runtime.start()
 
     window = GazeTestWindow(runtime, report, config, schema_id)
     window.show()
