@@ -238,8 +238,43 @@ class GazeTestWindow(QWidget):
             self._status = f"Cursor control {state}"
         elif k == Qt.Key.Key_C:
             self._run_calibration()
+        elif k == Qt.Key.Key_K:
+            self._open_activity("keyboard")
+        elif k == Qt.Key.Key_G:
+            self._open_activity("practice")
         else:
             super().keyPressEvent(event)
+
+    def _open_activity(self, kind: str) -> None:
+        if self._model is None:
+            self._status = "No calibration — press C first"
+            return
+        self._timer.stop()
+        try:
+            if kind == "keyboard":
+                from opengaze.desktop.keyboard_ui import GazeKeyboardWindow
+                win = GazeKeyboardWindow(
+                    self.runtime, _make_report(self.profile),
+                    self.config, self.schema_id, self._model,
+                    detector=self._detector,
+                )
+            else:
+                from opengaze.desktop.practice_ui import PracticeWindow
+                win = PracticeWindow(
+                    self.runtime, _make_report(self.profile),
+                    self.config, self.schema_id, self._model,
+                    detector=self._detector,
+                )
+            win.show()
+            app = QApplication.instance()
+            while win.isVisible():
+                app.processEvents()
+                time.sleep(0.03)
+        except Exception as exc:
+            log.warning("%s activity failed: %s", kind, exc)
+        self._filter_x.reset()
+        self._filter_y.reset()
+        self._timer.start()
 
     def _run_calibration(self) -> None:
         self._timer.stop()
@@ -370,7 +405,7 @@ class GazeTestWindow(QWidget):
         p.setPen(_TEXT)
 
         # Bottom bar
-        p.drawText(16, h - 16, "C = calibrate   Tab = cursor on/off   Space = pause   Esc = quit")
+        p.drawText(16, h - 16, "C=calibrate  K=keyboard  G=practice  Tab=cursor  Space=pause  Esc=quit")
         if self._status != self._status:
             pass
         p.setPen(QColor("#f0b429"))
