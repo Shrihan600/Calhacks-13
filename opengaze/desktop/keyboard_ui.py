@@ -1,15 +1,15 @@
 """Gaze-controlled on-screen keyboard.
 
 Dwell (0.8 s) on any key to type it.  Blink immediately types the
-highlighted key.  SPEAK uses macOS ``say`` for TTS.  Esc returns to
-the gaze test window.
+highlighted key.  MIC dictates with Cartesia Ink-Whisper; SPEAK reads the
+text aloud with Cartesia Sonic (macOS ``say`` when offline).  Esc returns
+to the gaze test window.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-import subprocess
 import time
 
 from PySide6.QtCore import Qt, QRect, QTimer
@@ -25,6 +25,8 @@ from opengaze.control.filter import OneEuroFilter, TemporalMedianFilter
 from opengaze.control.safety import ConfidenceGate
 from opengaze.vision.feature_extractor import build_mode_a
 from opengaze.vision.preprocessing import FrameNormalizer
+from opengaze.voice.cartesia import CartesiaConfig
+from opengaze.voice.service import VoiceService, VoiceState
 
 log = logging.getLogger("opengaze.keyboard_ui")
 
@@ -32,9 +34,11 @@ ROWS: list[list[str]] = [
     list("QWERTYUIOP"),
     list("ASDFGHJKL"),
     list("ZXCVBNM"),
-    ["SPACE", "⌫", "CLEAR", "SPEAK"],
+    ["MIC", "SPACE", "⌫", "CLEAR", "SPEAK"],
 ]
-_SPECIAL_W = {"SPACE": 4, "⌫": 2, "CLEAR": 2, "SPEAK": 2}
+_SPECIAL_W = {"MIC": 2, "SPACE": 3, "⌫": 1.5, "CLEAR": 1.5, "SPEAK": 2}
+# Toggle-style keys fire once per look; gaze must leave the key (or blink) to fire again.
+_ACTION_KEYS = {"MIC", "SPEAK"}
 _KEY_DWELL_S = 0.8
 _KEY_COOL_S = 0.5
 
@@ -62,6 +66,8 @@ _TEXT_BRIGHT = QColor("#e8e8e8")
 _DIM        = QColor("#555")
 _GAZE       = QColor(0, 212, 255, 180)
 _CURSOR_COL = QColor("#00d4ff")
+_MIC_LIVE   = QColor("#c0392b")
+_MIC_BUSY   = QColor("#6c4ab6")
 
 
 def _build_rects(w: int, h: int) -> dict[str, QRect]:
@@ -84,7 +90,7 @@ def _build_rects(w: int, h: int) -> dict[str, QRect]:
                 rects[key] = QRect(x, y, key_w, kh)
                 x += key_w + gap
         else:
-            widths = {k: key_w * _SPECIAL_W.get(k, 2) for k in row}
+            widths = {k: int(key_w * _SPECIAL_W.get(k, 2)) for k in row}
             total = sum(widths.values()) + (len(row) - 1) * gap
             x = (w - total) // 2
             for key in row:
@@ -139,6 +145,13 @@ class GazeKeyboardWindow(QWidget):
         self._cool_until: float = 0.0
         self._hit_key: str | None = None
         self._hit_until: float = 0.0
+        self._latched: str | None = None
+
+        self._voice = VoiceService(
+            cloud_enabled=config.privacy.cloud_features_enabled,
+            cartesia=CartesiaConfig.from_env(),
+        )
+        log.info(self._voice.status)
 
         self.setWindowTitle("OpenGaze — Keyboard")
         self.setStyleSheet("background: #0d0f12;")
@@ -154,6 +167,9 @@ class GazeKeyboardWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _tick(self) -> None:
+        for transcript in self._voice.poll():
+            self._insert_dictation(transcript)
+
         for cid in self._head_ids:
             frame = self._runtime.manager.latest(cid)
             if frame is None:
@@ -194,11 +210,14 @@ class GazeKeyboardWindow(QWidget):
             now = time.monotonic()
             in_cool = now < self._cool_until
 
+            if hovered != self._latched:
+                self._latched = None
+
             if hovered != self._dwell_key:
                 self._dwell_key = hovered
                 self._dwell_start = now
                 self._dwell_prog = 0.0
-            elif hovered and not in_cool:
+            elif hovered and not in_cool and hovered != self._latched:
                 elapsed = now - self._dwell_start
                 self._dwell_prog = min(elapsed / _KEY_DWELL_S, 1.0)
                 if elapsed >= _KEY_DWELL_S:
@@ -219,12 +238,12 @@ class GazeKeyboardWindow(QWidget):
         elif key == "CLEAR":
             self._text = ""
         elif key == "SPEAK":
-            if self._text.strip():
-                try:
-                    subprocess.Popen(["say", self._text])
-                except Exception:
-                    pass
-            return
+            if self._voice.state is VoiceState.SPEAKING:
+                self._voice.stop_speaking()
+            else:
+                self._voice.speak(self._text)
+        elif key == "MIC":
+            self._voice.toggle_dictation()
         else:
             self._text += key
         self._hit_key = key
@@ -232,6 +251,13 @@ class GazeKeyboardWindow(QWidget):
         self._dwell_key = None
         self._dwell_prog = 0.0
         self._cool_until = now + _KEY_COOL_S
+        if key in _ACTION_KEYS:
+            self._latched = key
+
+    def _insert_dictation(self, transcript: str) -> None:
+        if self._text and not self._text.endswith(" "):
+            self._text += " "
+        self._text += transcript
 
     # ------------------------------------------------------------------
     # Paint
@@ -263,7 +289,8 @@ class GazeKeyboardWindow(QWidget):
 
         p.setFont(QFont("Menlo", 11))
         p.setPen(_DIM)
-        p.drawText(32, 22, "TYPED TEXT  —  dwell 0.8s or blink to type  •  Esc = back")
+        p.drawText(32, 22, "TYPED TEXT  —  dwell 0.8s or blink to type  •  MIC = dictate  •  Esc = back")
+        self._draw_voice_status(p, w, th)
 
         p.setFont(QFont("Helvetica Neue", 36))
         p.setPen(_CURSOR_COL if self._text else _DIM)
@@ -281,12 +308,42 @@ class GazeKeyboardWindow(QWidget):
             p.setPen(QPen(_CURSOR_COL, 2))
             p.drawLine(cx, cy_top, cx, cy_top + 40)
 
+    def _draw_voice_status(self, p: QPainter, w: int, th: int) -> None:
+        state = self._voice.state
+        p.setFont(QFont("Menlo", 11))
+        if state is VoiceState.LISTENING:
+            p.setPen(_MIC_LIVE)
+            p.setBrush(_MIC_LIVE)
+            p.drawEllipse(32, th - 30, 10, 10)
+            bar_w = int(160 * self._voice.mic_level)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRect(52, th - 28, bar_w, 6)
+            p.setPen(_TEXT_BRIGHT)
+            p.drawText(224, th - 20, self._voice.status)
+        else:
+            p.setPen(_KEY_RING if state is not VoiceState.IDLE else _DIM)
+            p.drawText(32, th - 20, self._voice.status)
+
+    def _key_label(self, key: str) -> str:
+        if key == "MIC":
+            return {
+                VoiceState.LISTENING: "● STOP",
+                VoiceState.TRANSCRIBING: "…",
+            }.get(self._voice.state, "MIC")
+        if key == "SPEAK" and self._voice.state is VoiceState.SPEAKING:
+            return "■ STOP"
+        return key
+
     def _draw_keys(self, p: QPainter) -> None:
         now = time.monotonic()
         for key, rect in self._rects.items():
             is_hit = key == self._hit_key and now < self._hit_until
             is_hov = key == self._hovered
             bg = _KEY_HIT if is_hit else (_KEY_HOVER if is_hov else _KEY_IDLE)
+            if key == "MIC" and self._voice.state is VoiceState.LISTENING:
+                bg = _MIC_LIVE
+            elif key == "MIC" and self._voice.state is VoiceState.TRANSCRIBING:
+                bg = _MIC_BUSY
 
             p.setBrush(bg)
             p.setPen(QPen(QColor("#2a3040"), 1))
@@ -306,7 +363,7 @@ class GazeKeyboardWindow(QWidget):
             p.setFont(QFont("Helvetica Neue", fsz,
                             QFont.Weight.Bold if is_hov else QFont.Weight.Normal))
             p.setPen(_KEY_RING if is_hov else (_TEXT_BRIGHT if is_hit else QColor("#9ba8c0")))
-            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, key)
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._key_label(key))
 
     def _draw_gaze(self, p: QPainter, w: int, h: int) -> None:
         gx = int(self._gaze_x * w)
@@ -334,6 +391,7 @@ class GazeKeyboardWindow(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._timer.stop()
+        self._voice.shutdown()
         if self._owns_detector and self._detector is not None:
             self._detector.close()
         super().closeEvent(event)

@@ -15,7 +15,9 @@ You look at the screen. The software tracks where your eyes are pointing and mov
 | Fullscreen gaze test environment | **Working** |
 | Long-blink click (hold blink 400 ms) | **Working** |
 | Real mouse cursor control | **Working** |
-| On-screen gaze keyboard with TTS | **Working** |
+| On-screen gaze keyboard | **Working** |
+| Voice dictation — Cartesia Ink-Whisper STT | **Working** (opt-in, needs API key) |
+| Speak typed text — Cartesia Sonic TTS (macOS `say` offline) | **Working** |
 | Target practice game | **Working** |
 | Eye-camera glasses support (Mode C) | Architecture ready, hardware pending |
 | AAC communication board + Claude AI | Planned |
@@ -31,7 +33,7 @@ You look at the screen. The software tracks where your eyes are pointing and mov
 | 3 | Calibration: 9-point wizard, ridge regression model, validation, on-disk storage | **done** |
 | 4 | Control: One Euro filter, blink click, safety gates, Quartz cursor driver, gaze test UI | **done** |
 | 5 | Eye-camera glasses (USB/Pi/ESP32), Mode B/C pupil detector | next |
-| 6 | AAC board, Claude AI text, Cartesia TTS, Convex backend | planned |
+| 6 | Cartesia STT + TTS (**done**); AAC board, Claude AI text, Convex backend | in progress |
 
 ---
 
@@ -145,7 +147,7 @@ TYPED TEXT area (top 30%)
 Q  W  E  R  T  Y  U  I  O  P
  A  S  D  F  G  H  J  K  L
    Z  X  C  V  B  N  M
-  SPACE    ⌫    CLEAR    SPEAK
+  MIC   SPACE   ⌫   CLEAR   SPEAK
 ```
 
 **How to type:**
@@ -157,13 +159,51 @@ Q  W  E  R  T  Y  U  I  O  P
 - `SPACE` — inserts a space
 - `⌫` — deletes the last character
 - `CLEAR` — clears all typed text
-- `SPEAK` — reads the typed text aloud using macOS text-to-speech (`say`)
+- `MIC` — dictate instead of typing (Cartesia Ink-Whisper). The key turns red while listening and stops on its own after a 1.5 s pause, so you don't have to aim at it again. Look at it again or blink to stop early. The transcript is appended to the typed text so you can fix it with the keyboard before speaking it.
+- `SPEAK` — reads the typed text aloud with Cartesia Sonic, or macOS `say` when offline. Activate it again while speaking to stop.
+
+`MIC` and `SPEAK` fire once per look: move your gaze off the key (or blink) to trigger it again, so staring at the key never re-fires it.
 
 The keyboard uses **nearest-key snapping**: if your gaze is slightly between two keys, the closer key center wins. This compensates for webcam accuracy limitations.
 
 Press **Esc** to return to the gaze test window.
 
 ---
+
+### Voice (Cartesia)
+
+Typing by gaze takes about 2–5 seconds per letter. Many people who need eye-gaze input can still speak, at least partly or when they're not tired, and many can't speak at all. OpenGaze supports both: speak to write, then gaze-edit; or type with your eyes and have a natural voice say it.
+
+**Setup:**
+
+1. Get a key at [play.cartesia.ai/keys](https://play.cartesia.ai/keys)
+2. `cp .env.example .env` and set `CARTESIA_API_KEY=sk_car_...`. Optionally set `CARTESIA_VOICE_ID` (any voice from the playground) and `CARTESIA_LANGUAGE` (ISO-639-1, default `en`).
+3. Check it works without a camera or calibration:
+   ```bash
+   .venv/bin/opengaze voice-test --cloud
+   ```
+   This speaks a sentence with Sonic, then records you until you pause, transcribes with Ink-Whisper, and speaks back what it heard. Add `--tts-only` to skip the mic.
+4. `.venv/bin/opengaze run --cloud` → press **K**. The status line under the typed text shows `Voice: Cartesia (Ink-Whisper + Sonic)`.
+
+`--cloud` opts in for that session only. To opt in permanently, set `privacy.cloud_features_enabled: true` in `configs/default.yaml`.
+
+Without both a key and the opt-in, nothing is sent anywhere: `SPEAK` uses macOS `say`, and `MIC` shows a message explaining how to enable it.
+
+**Cartesia features used:**
+
+| Feature | Endpoint | Used for |
+|---|---|---|
+| Ink-Whisper speech-to-text (batch) | `POST /stt` | `MIC` dictation into the keyboard buffer |
+| Sonic-3.6 text-to-speech (raw PCM, 24 kHz) | `POST /tts/bytes` | `SPEAK` reads typed or dictated text aloud |
+
+The code is in `opengaze/voice/`: `cartesia.py` (stdlib-only REST client), `audio.py` (mic capture with end-of-speech detection), `service.py` (non-blocking state machine the UI polls each frame).
+
+**Known limitations:**
+
+- Dictation is batch: words appear after you stop talking (usually under a second or two), not while you speak
+- End-of-speech detection uses a fixed loudness threshold, so a noisy room may keep it listening until the 20 s cap
+- No offline speech-to-text fallback; if Cartesia is unreachable, an error shows and you type instead
+- English is the default; other languages need `CARTESIA_LANGUAGE`
 
 ### Target practice game
 
@@ -218,6 +258,9 @@ Live camera previews and health monitoring (useful to verify cameras are working
 
 # Run capture headlessly and print health tables (SSH/CI)
 .venv/bin/opengaze headless --seconds 10
+
+# Check Cartesia voice (TTS + dictation) without a camera
+.venv/bin/opengaze voice-test --cloud
 
 # Re-download the MediaPipe model
 .venv/bin/opengaze download-models --force
@@ -298,9 +341,13 @@ opengaze/
   desktop/
     calibration_ui.py             PySide6 calibration wizard (9 dots, validation heatmap)
     run_ui.py                     Fullscreen gaze test environment
-    keyboard_ui.py                On-screen gaze keyboard with TTS
+    keyboard_ui.py                On-screen gaze keyboard with dictation + speech
     practice_ui.py                Target practice game
     diagnostics.py                Live camera health + preview window
+  voice/
+    cartesia.py                   Cartesia REST client: Ink-Whisper STT, Sonic TTS
+    audio.py                      MicRecorder: capture + automatic end-of-speech
+    service.py                    VoiceService: non-blocking dictation/speech, offline fallback
   modes.py                        TrackingMode enum, infer_mode()
   imaging.py                      Low-level image transforms
   cli.py                          opengaze CLI entry point
@@ -311,6 +358,7 @@ tests/
   test_vision.py                  feature extractor, normalizer
   test_calibration.py             GazeModel, CalibrationSession, ValidationReport, store
   test_control.py                 OneEuroFilter, DwellDetector, safety, GazeDriver
+  test_voice.py                   Cartesia client (mocked HTTP), end-of-speech, VoiceService
 
 scripts/
   make_synthetic_recording.py     render a synthetic eye video for replay testing
@@ -327,7 +375,7 @@ docs/
 .venv/bin/python -m pytest
 ```
 
-244 tests, all hardware-free. Uses synthetic cameras, fault injection, and a mocked cursor. Real-webcam tests are opt-in:
+259 tests, all hardware-free and network-free. Uses synthetic cameras, fault injection, and a mocked cursor. Real-webcam tests are opt-in:
 
 ```bash
 .venv/bin/python -m pytest -m hardware
@@ -337,7 +385,7 @@ docs/
 
 ## Privacy
 
-Everything runs locally on your Mac. No video, no gaze data, and no personal information leaves the device. The calibration model is stored in `~/.config/opengaze/calibrations/` and is never uploaded anywhere. See [docs/privacy.md](docs/privacy.md).
+Gaze tracking runs entirely on your Mac. No video and no gaze data ever leave the device. The only network traffic is optional Cartesia voice: when you opt in, audio you record with `MIC` and text you send with `SPEAK` go to Cartesia. Nothing is sent until you activate one of those keys. The calibration model is stored in `~/.config/opengaze/calibrations/` and is never uploaded anywhere. See [docs/privacy.md](docs/privacy.md).
 
 ---
 

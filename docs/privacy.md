@@ -8,8 +8,14 @@ that data on the Mac and short-lived.
 - **Local processing only.** Camera frames are processed in memory. Nothing is sent over the network.
 - **No recording.** No camera image is written to disk. `privacy.allow_recording` defaults to
   `false`, and no recording feature exists yet.
-- **No cloud features.** The Claude, Cartesia and Convex modules haven't been built yet.
-  `privacy.cloud_features_enabled` defaults to `false`.
+- **Cloud features are opt-in.** `privacy.cloud_features_enabled` defaults to `false`. The only
+  cloud feature built so far is Cartesia voice (`opengaze/voice/`). It runs only when that flag
+  is `true` *and* `CARTESIA_API_KEY` is set. Then:
+  - The microphone opens only when the user activates `MIC`, a red indicator shows while it
+    listens, and it closes automatically after a pause (20 s hard cap). The recording is held in
+    memory, sent to Cartesia `/stt`, and discarded. It is never written to disk.
+  - Only text the user activates `SPEAK` on is sent to Cartesia `/tts/bytes`.
+  - With the flag off or no key, `SPEAK` uses the on-device macOS voice and nothing is sent.
 - **No credentials in the repository.** `.env` is git-ignored. `.env.example` lists the variables,
   all empty.
 - **Non-live data is labeled.** Synthetic and recorded sources are marked in every `CameraFrame`

@@ -27,8 +27,16 @@ def configure_logging(level: str) -> None:
     )
 
 
+def _with_cloud_flag(config: AppConfig, args: argparse.Namespace) -> AppConfig:
+    """``--cloud`` opts into cloud features for this session only."""
+    if not getattr(args, "cloud", False):
+        return config
+    privacy = config.privacy.model_copy(update={"cloud_features_enabled": True})
+    return config.model_copy(update={"privacy": privacy})
+
+
 def _load(args: argparse.Namespace) -> tuple[AppConfig, ProfileReport]:
-    config = load_app_config(args.config)
+    config = _with_cloud_flag(load_app_config(args.config), args)
     configure_logging(args.log_level or config.app.log_level)
     profile_path = Path(args.profile) if args.profile else config.app.hardware_profile
     report = check_hardware_profile(profile_path, [Path(p) for p in args.overlay])
@@ -196,6 +204,68 @@ def cmd_run(args: argparse.Namespace) -> int:
     return run_gaze_test(report, config)
 
 
+def cmd_voice_test(args: argparse.Namespace) -> int:
+    """Check Cartesia TTS and STT end to end, with no camera or calibration needed."""
+    from opengaze.voice.cartesia import CartesiaConfig
+    from opengaze.voice.service import VoiceService, VoiceState
+
+    config = _with_cloud_flag(load_app_config(args.config), args)
+    configure_logging(args.log_level or "WARNING")
+    cartesia = CartesiaConfig.from_env()
+    if cartesia is None:
+        print("CARTESIA_API_KEY not set. Add it to .env (see .env.example).")
+        return 1
+    if not config.privacy.cloud_features_enabled:
+        print("Cloud features are off. Re-run with --cloud, or set "
+              "privacy.cloud_features_enabled: true in configs/default.yaml.")
+        return 1
+    print(f"key: ...{cartesia.api_key[-4:]}  voice: {cartesia.voice_id}  "
+          f"language: {cartesia.language}")
+
+    svc = VoiceService(cloud_enabled=True, cartesia=cartesia)
+
+    def wait_idle(timeout: float) -> bool:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            transcripts.extend(svc.poll())
+            if svc.state is VoiceState.IDLE:
+                return True
+            time.sleep(0.05)
+        return False
+
+    transcripts: list[str] = []
+    print("\n[1/2] Text-to-speech (Sonic): you should hear a sentence…")
+    svc.speak(args.text)
+    wait_idle(30)
+    print(f"      {svc.status}")
+    if "unavailable" in svc.status or "failed" in svc.status:
+        return 1
+
+    if args.tts_only:
+        return 0
+    print("\n[2/2] Speech-to-text (Ink-Whisper): say something now; "
+          "it stops after a 1.5 s pause…")
+    svc.start_dictation()
+    if svc.state is not VoiceState.LISTENING:
+        print(f"      {svc.status}")
+        return 1
+    while svc.state is VoiceState.LISTENING:
+        bar = "#" * int(svc.mic_level * 30)
+        print(f"\r      mic [{bar:<30}]", end="", flush=True)
+        transcripts.extend(svc.poll())
+        time.sleep(0.05)
+    print("\r      transcribing…" + " " * 30)
+    wait_idle(30)
+    print(f"      {svc.status}")
+    if not transcripts:
+        return 1
+    heard = " ".join(transcripts)
+    print(f'\n      heard: "{heard}"\n      speaking it back…')
+    svc.speak(heard)
+    wait_idle(30)
+    return 0
+
+
 def cmd_calibrate(args: argparse.Namespace) -> int:
     config, report = _load(args)
     if not report.ok:
@@ -253,6 +323,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("run", help="open gaze test environment (auto-calibrates if needed)")
     add_profile_args(p)
+    p.add_argument("--cloud", action="store_true",
+                   help="opt into Cartesia voice for this session")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("diagnostics", help="live camera previews and health (PySide6)")
@@ -278,6 +350,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", help="save to this path instead of the default cache location")
     p.add_argument("--force", action="store_true", help="re-download even if already present")
     p.set_defaults(func=cmd_download_models)
+
+    p = sub.add_parser("voice-test", help="check Cartesia speech + dictation (no camera)")
+    p.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="app config YAML")
+    p.add_argument("--cloud", action="store_true",
+                   help="opt into Cartesia voice for this session")
+    p.add_argument("--tts-only", action="store_true", help="skip the microphone step")
+    p.add_argument("--text", default="Hi, I'm using OpenGaze to talk with my eyes.",
+                   help="sentence to speak in the TTS step")
+    p.set_defaults(func=cmd_voice_test)
 
     p = sub.add_parser("calibrate", help="run the 9-point gaze calibration wizard (PySide6)")
     add_profile_args(p)
