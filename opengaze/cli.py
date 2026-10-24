@@ -181,6 +181,143 @@ def cmd_download_models(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_run(args: argparse.Namespace) -> int:
+    """Start gaze-driven cursor control."""
+    import asyncio
+
+    from opengaze.calibration.storage import CalibrationStore
+    from opengaze.cameras.manager import CameraManager
+    from opengaze.cameras.runtime import CaptureRuntime
+    from opengaze.cameras.types import CameraRole
+    from opengaze.control.cursor import (
+        QuartzCursorDriver,
+        is_accessibility_granted,
+        open_accessibility_prefs,
+    )
+    from opengaze.control.driver import GazeDriver
+    from opengaze.modes import TrackingMode, infer_mode
+    from opengaze.vision.feature_extractor import build_mode_a
+    from opengaze.vision.preprocessing import FrameNormalizer
+
+    config, report = _load(args)
+    if not report.ok:
+        _print_report(report)
+        return 1
+    assert report.profile is not None
+
+    if not is_accessibility_granted():
+        print(
+            "Accessibility permission is required to move the cursor.\n"
+            "Opening System Settings > Privacy & Security > Accessibility…\n"
+            "Enable this terminal (or the opengaze entry) then re-run."
+        )
+        open_accessibility_prefs()
+        return 1
+
+    mode = infer_mode({cam.role for cam in report.profile.enabled_cameras.values()})
+    schema_map = {
+        TrackingMode.WEBCAM_ONLY: "A-webcam",
+        TrackingMode.SINGLE_EYE: "B-single-eye",
+        TrackingMode.DUAL_EYE: "C-dual-eye",
+    }
+    schema_id = schema_map.get(mode, "A-webcam")  # type: ignore[arg-type]
+
+    store = CalibrationStore()
+    try:
+        model = store.load(schema_id, report.profile)  # type: ignore[arg-type]
+    except FileNotFoundError:
+        print(f"No calibration found for {schema_id!r}.  Run:  opengaze calibrate")
+        return 1
+    except ValueError as exc:
+        print(f"Calibration is stale:\n{exc}\nRun:  opengaze calibrate")
+        return 1
+
+    from opengaze.vision.mediapipe_detector import FaceLandmarkDetector, default_model_path
+    model_path = config.vision.face_landmarker_model_path or default_model_path()
+    if not model_path.exists():
+        print("MediaPipe model missing.  Run:  opengaze download-models")
+        return 1
+
+    ensure_camera_permission(report)
+    cursor = QuartzCursorDriver()
+    detector = FaceLandmarkDetector(model_path)
+    normalizer = FrameNormalizer()
+    driver = GazeDriver(
+        model,
+        cursor,
+        dwell_ms=args.dwell_ms,
+        dwell_enabled=not args.no_dwell,
+    )
+    head_ids = {
+        cid for cid, cam in report.profile.enabled_cameras.items()
+        if cam.role is CameraRole.HEAD
+    }
+
+    manager = CameraManager.from_profile(report.profile, config.capture)
+    runtime = CaptureRuntime(manager)
+    runtime.start()
+
+    print(
+        f"OpenGaze running  |  schema={schema_id}  dwell={'off' if args.no_dwell else f'{args.dwell_ms:.0f}ms'}\n"
+        "Ctrl+C to stop  |  Ctrl+Z to pause/resume"
+    )
+
+    async def loop() -> None:
+        import signal
+        paused = False
+
+        def _sigtstp(*_):
+            nonlocal paused
+            paused = driver.toggle_pause()
+            print(f"\n{'⏸  paused' if paused else '▶  resumed'}", flush=True)
+
+        try:
+            signal.signal(signal.SIGTSTP, _sigtstp)
+        except (OSError, AttributeError):
+            pass
+
+        last_report = 0.0
+        while True:
+            await asyncio.sleep(1.0 / 30)
+            for cid in head_ids:
+                frame = manager.latest(cid)
+                if frame is None:
+                    continue
+                frame = normalizer(frame)
+                try:
+                    head, eyes = detector.detect(frame)
+                except Exception:
+                    continue
+                left = next((e for e in eyes if e.eye == "left"), None)
+                right = next((e for e in eyes if e.eye == "right"), None)
+                fv = build_mode_a(head, left, right)
+                result = driver.push(fv)
+
+                now = asyncio.get_event_loop().time()
+                if now - last_report >= 1.0:
+                    last_report = now
+                    if result.sample and result.screen_x_px is not None:
+                        conf = f"{result.sample.confidence:.2f}"
+                        dwell = f"{driver.dwell_progress * 100:.0f}%"
+                        print(
+                            f"\rgaze ({result.screen_x_px:4d}, {result.screen_y_px:4d})"
+                            f"  conf {conf}  dwell {dwell}"
+                            f"  clicks {driver.clicks_fired}"
+                            f"  dropped {driver.frames_dropped}",
+                            end="",
+                            flush=True,
+                        )
+
+    try:
+        asyncio.run(loop())
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        runtime.stop()
+        detector.close()
+    return 0
+
+
 def cmd_calibrate(args: argparse.Namespace) -> int:
     config, report = _load(args)
     if not report.ok:
@@ -235,6 +372,12 @@ def build_parser() -> argparse.ArgumentParser:
             default=[],
             help="per-user overlay YAML merged over the profile (repeatable)",
         )
+
+    p = sub.add_parser("run", help="start gaze-driven cursor control")
+    add_profile_args(p)
+    p.add_argument("--dwell-ms", type=float, default=600.0, help="dwell click duration in ms")
+    p.add_argument("--no-dwell", action="store_true", help="disable dwell click")
+    p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("diagnostics", help="live camera previews and health (PySide6)")
     add_profile_args(p)
