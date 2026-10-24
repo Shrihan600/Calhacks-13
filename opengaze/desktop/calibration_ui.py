@@ -199,6 +199,9 @@ class CalibrationWindow(QWidget):
             self._validation = validate_calibration(
                 self.session.points,
                 schema_id=self._schema_id,
+                # Mode A (webcam-only) is inherently coarse — 0.15 norm ≈ 150–290px
+                # depending on screen size, which is realistic for iris-from-webcam.
+                pass_threshold_norm=0.15,
                 screen_width_px=w,
                 screen_height_px=h,
             )
@@ -334,14 +337,17 @@ class CalibrationWindow(QWidget):
 
         # Summary
         if result and report:
+            quality = (
+                "Good accuracy" if report.passed
+                else "Low accuracy — try better lighting or sit closer"
+            )
             lines = [
                 "Calibration complete",
-                f"Mean error: {report.mean_error_norm:.4f} norm"
-                + (f"  /  {report.mean_error_px:.0f} px" if report.mean_error_px else ""),
-                f"Max error:  {report.max_error_norm:.4f} norm"
-                + (f"  /  {report.max_error_px:.0f} px" if report.max_error_px else ""),
-                f"{'✓ PASS' if report.passed else '✗ FAIL — consider recalibrating'}",
+                f"Mean error: {report.mean_error_px:.0f} px" if report.mean_error_px else
+                f"Mean error: {report.mean_error_norm:.3f} norm",
+                quality,
                 "",
+                "Dots: green = accurate  red = less accurate",
                 "Press Space or click to save.  Escape to discard.",
             ]
         else:
