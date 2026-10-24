@@ -1,0 +1,22 @@
+# OpenGaze application settings. Paths are relative to this file.
+app:
+  hardware_profile: hardware/webcam-only.yaml
+  log_level: INFO
+
+capture:
+  # A streaming camera with no new frame for this long is shown as STALLED.
+  stale_frame_timeout_s: 1.0
+  # Reconnect backoff after a disconnect: doubles from initial up to max.
+  reconnect_initial_delay_s: 0.5
+  reconnect_max_delay_s: 5.0
+
+diagnostics:
+  preview_fps: 30
+  # Show frames after rotation/mirror/crop from the hardware profile (false = raw sensor image).
+  show_normalized: true
+
+privacy:
+  # Recording camera video to disk is off unless explicitly enabled AND consented to in the UI.
+  allow_recording: false
+  # Cloud features (Claude, Cartesia, Convex) are opt-in; raw images are never sent regardless.
+  cloud_features_enabled: false

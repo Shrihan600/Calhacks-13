@@ -1,0 +1,21 @@
+# Mode A: the built-in MacBook webcam only. No custom hardware required.
+# Used for head pose and MediaPipe's approximate iris landmarks (coarse accuracy; use large targets).
+hardware_profile:
+  id: webcam-only
+  version: 1
+  frame_design: none
+  description: Built-in MacBook webcam (Mode A fallback).
+
+  cameras:
+    head:
+      source_type: mac_webcam
+      device_id: auto          # "auto" = index 0; set an integer if another camera takes index 0
+      resolution: [1280, 720]  # 720p keeps MediaPipe fast on an 8 GB M2; the sensor supports 1080p
+      fps: 30
+      rotation_degrees: 0
+      mirror_horizontal: false
+      mounting_position: display_top
+
+  calibration:
+    screen_mapping: per_user
+    geometry_estimation: data_driven

@@ -1,0 +1,25 @@
+# Replays a recorded eye video (generate one with `python scripts/make_synthetic_recording.py`).
+# Frames are labeled RECORDED, never live.
+hardware_profile:
+  id: replay
+  version: 1
+  frame_design: recorded
+
+  cameras:
+    left_eye:
+      source_type: recorded
+      options:
+        path: ../../demo/synthetic_eye.avi   # relative to this file
+        loop: true
+        realtime: true
+
+    head:
+      source_type: synthetic
+      resolution: [640, 360]
+      fps: 30
+      options:
+        pattern: test_card
+
+  calibration:
+    screen_mapping: per_user
+    geometry_estimation: data_driven

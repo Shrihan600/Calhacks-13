@@ -1,0 +1,32 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+
+# Secrets — never commit real keys; copy .env.example to .env
+.env
+.env.*
+!.env.example
+
+# Local data: calibrations, recordings, logs (may contain biometric data)
+data/
+recordings/
+logs/
+demo/*.mp4
+demo/*.avi
+
+# Node / dashboard
+node_modules/
+dashboard/dist/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+demo/*.csv

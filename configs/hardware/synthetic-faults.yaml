@@ -1,0 +1,40 @@
+# Simulated rig with injected failures, for exercising reconnects, drops and timing in the UI.
+hardware_profile:
+  id: synthetic-faults
+  version: 1
+  frame_design: simulated
+
+  cameras:
+    left_eye:
+      source_type: synthetic
+      resolution: [320, 240]
+      fps: 30
+      options:
+        pattern: eye
+        motion: lissajous
+        drop_probability: 0.1      # ~10% of frames never arrive (sequence gaps)
+        latency_ms: 40             # capture-to-receive delay, like a network camera
+        jitter_ms: 15
+        noise_std: 12
+
+    right_eye:
+      source_type: synthetic
+      resolution: [320, 240]
+      fps: 15                      # independent, slower frame rate
+      options:
+        pattern: eye
+        motion: lissajous
+        disconnect_after_frames: 150   # drops the connection every ~10 s; manager reconnects
+        fail_connect_attempts: 2
+
+    head:
+      source_type: synthetic
+      resolution: [640, 360]
+      fps: 30
+      options:
+        pattern: test_card
+        corrupt_probability: 0.03  # occasional damaged frames, flagged as PARTIAL
+
+  calibration:
+    screen_mapping: per_user
+    geometry_estimation: data_driven

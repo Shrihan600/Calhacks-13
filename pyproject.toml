@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opengaze"
+version = "0.1.0"
+description = "Hardware-agnostic eye-gaze computer control for macOS (CalHacks 13.0 prototype)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26,<3",
+    "opencv-contrib-python>=4.9",  # contrib build: MediaPipe depends on it; never install both
+    "pydantic>=2.6,<3",
+    "PyYAML>=6.0",
+    "pyobjc-framework-AVFoundation>=10; sys_platform == 'darwin'",  # camera permission
+]
+
+[project.optional-dependencies]
+desktop = [
+    "PySide6>=6.6",
+    "pyobjc-framework-Quartz>=10; sys_platform == 'darwin'",
+]
+tracking = [
+    "mediapipe>=0.10.14",
+    "scipy>=1.11",
+    "scikit-learn>=1.4",
+]
+api = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+all = ["opengaze[desktop,tracking,api,dev]"]
+
+[project.scripts]
+opengaze = "opengaze.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["opengaze*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["hardware: needs a real camera; run with `pytest -m hardware`"]
+addopts = "-m 'not hardware'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

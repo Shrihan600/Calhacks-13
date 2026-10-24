@@ -1,0 +1,45 @@
+# Mode B template: one external USB/UVC eye camera + the MacBook webcam for head pose.
+# Run `opengaze probe-cameras` to find the eye camera's index, then set device_id below.
+# Enable right_eye (and give it a device_id) for Mode C.
+hardware_profile:
+  id: generic-usb
+  version: 1
+  frame_design: unfinalized
+
+  cameras:
+    left_eye:
+      source_type: usb
+      device_id: null          # REQUIRED: integer index from `opengaze probe-cameras`
+      resolution: [640, 480]
+      fps: 30
+      rotation_degrees: 0      # right angles only; set to undo how the module is physically mounted
+      mirror_horizontal: false
+      mounting_position: unknown
+      crop: null               # e.g. {x: 0.1, y: 0.2, width: 0.8, height: 0.6} as fractions
+      geometry:                # all optional; unknown values stay null (data-driven calibration)
+        camera_to_eye_mm: null
+        angle_to_pupil_deg: null
+      optics:
+        focal_length_mm: null
+        intrinsics: null
+        distortion: null
+      controls:                # passed to the driver as-is; unsupported ones are reported, not faked
+        exposure: null
+        auto_exposure: null
+        focus: null
+
+    right_eye:
+      source_type: usb
+      enabled: false
+      device_id: null
+
+    head:
+      source_type: mac_webcam
+      device_id: auto
+      resolution: [1280, 720]
+      fps: 30
+      mounting_position: display_top
+
+  calibration:
+    screen_mapping: per_user
+    geometry_estimation: data_driven

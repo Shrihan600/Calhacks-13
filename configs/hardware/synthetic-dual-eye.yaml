@@ -1,0 +1,44 @@
+# Fully simulated Mode C rig: two eye cameras + head camera. No hardware needed.
+# Everything from this profile is labeled SYNTHETIC in the UI and in every CameraFrame.
+hardware_profile:
+  id: synthetic-dual-eye
+  version: 1
+  frame_design: simulated
+
+  cameras:
+    left_eye:
+      source_type: synthetic
+      resolution: [320, 240]
+      fps: 60
+      mounting_position: below_eye
+      options:
+        pattern: eye
+        motion: saccades
+        motion_seed: 7         # both eyes share the gaze trajectory...
+        noise_seed: 1          # ...but get independent sensor noise
+
+    right_eye:
+      source_type: synthetic
+      resolution: [320, 240]
+      fps: 60
+      mounting_position: below_eye
+      # This simulated module is "mounted" upside down; the profile rotation undoes it.
+      rotation_degrees: 180
+      options:
+        pattern: eye
+        motion: saccades
+        motion_seed: 7
+        noise_seed: 2
+        mount_rotation_degrees: 180
+
+    head:
+      source_type: synthetic
+      resolution: [640, 360]
+      fps: 30
+      mounting_position: display_top
+      options:
+        pattern: test_card
+
+  calibration:
+    screen_mapping: per_user
+    geometry_estimation: data_driven
