@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import deque
 
 
 class _LowPassFilter:
@@ -98,3 +99,26 @@ class OneEuroFilter:
         self._last_x = None
         if value is not None:
             self._xf._y = value
+
+
+class TemporalMedianFilter:
+    """Sliding-window median to suppress single-frame MediaPipe outliers.
+
+    A window of 5 frames at 30 fps removes spikes with ~67 ms of lag.
+    """
+
+    __slots__ = ("_buf", "_window")
+
+    def __init__(self, window: int = 5) -> None:
+        self._buf: deque[float] = deque(maxlen=window)
+        self._window = window
+
+    def __call__(self, x: float) -> float:
+        self._buf.append(x)
+        s = sorted(self._buf)
+        return s[len(s) // 2]
+
+    def reset(self, value: float | None = None) -> None:
+        self._buf.clear()
+        if value is not None:
+            self._buf.append(value)

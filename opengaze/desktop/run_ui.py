@@ -32,7 +32,7 @@ from opengaze.cameras.types import CameraRole, SourceKind
 from opengaze.config.loader import ProfileReport
 from opengaze.config.schema import AppConfig
 from opengaze.control.blink import BlinkClickDetector
-from opengaze.control.filter import OneEuroFilter
+from opengaze.control.filter import OneEuroFilter, TemporalMedianFilter
 from opengaze.control.safety import ConfidenceGate
 from opengaze.modes import TrackingMode, infer_mode
 from opengaze.vision.feature_extractor import build_mode_a
@@ -101,9 +101,12 @@ class GazeTestWindow(QWidget):
         self._model = None
         self._load_model()
 
-        # Gaze pipeline
-        self._filter_x = OneEuroFilter(min_cutoff=0.8, beta=0.07)
-        self._filter_y = OneEuroFilter(min_cutoff=0.8, beta=0.07)
+        # Gaze pipeline — median pre-filter kills single-frame outliers;
+        # low min_cutoff (0.3) gives heavy smoothing when gaze is nearly still.
+        self._median_x = TemporalMedianFilter(5)
+        self._median_y = TemporalMedianFilter(5)
+        self._filter_x = OneEuroFilter(min_cutoff=0.3, beta=0.1)
+        self._filter_y = OneEuroFilter(min_cutoff=0.3, beta=0.1)
         self._conf_gate = ConfidenceGate(min_confidence=0.25)
         self._blink = BlinkClickDetector(long_blink_ms=400, short_blink_ms=180)
 
@@ -205,8 +208,10 @@ class GazeTestWindow(QWidget):
 
                 self._confidence = sample.confidence
                 t = time.monotonic()
-                self._gaze_x = _expand(self._filter_x(sample.screen_x_norm, t))
-                self._gaze_y = _expand(self._filter_y(sample.screen_y_norm, t))
+                rx = self._median_x(sample.screen_x_norm)
+                ry = self._median_y(sample.screen_y_norm)
+                self._gaze_x = _expand(self._filter_x(rx, t))
+                self._gaze_y = _expand(self._filter_y(ry, t))
 
                 if self._cursor_enabled and self._cursor:
                     px, py = self._cursor.norm_to_px(self._gaze_x, self._gaze_y)
@@ -234,6 +239,7 @@ class GazeTestWindow(QWidget):
         elif k == Qt.Key.Key_Space:
             self._paused = not self._paused
             if not self._paused:
+                self._median_x.reset(); self._median_y.reset()
                 self._filter_x.reset()
                 self._filter_y.reset()
         elif k == Qt.Key.Key_Tab:
@@ -276,6 +282,7 @@ class GazeTestWindow(QWidget):
                 time.sleep(0.03)
         except Exception as exc:
             log.warning("%s activity failed: %s", kind, exc)
+        self._median_x.reset(); self._median_y.reset()
         self._filter_x.reset()
         self._filter_y.reset()
         self._timer.start()
@@ -294,6 +301,7 @@ class GazeTestWindow(QWidget):
         except Exception as exc:
             log.warning("calibration failed: %s", exc)
         self._load_model()
+        self._median_x.reset(); self._median_y.reset()
         self._filter_x.reset()
         self._filter_y.reset()
         self._timer.start()

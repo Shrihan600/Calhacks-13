@@ -21,7 +21,7 @@ from opengaze.cameras.runtime import CaptureRuntime
 from opengaze.config.loader import ProfileReport
 from opengaze.config.schema import AppConfig
 from opengaze.control.blink import BlinkClickDetector
-from opengaze.control.filter import OneEuroFilter
+from opengaze.control.filter import OneEuroFilter, TemporalMedianFilter
 from opengaze.control.safety import ConfidenceGate
 from opengaze.vision.feature_extractor import build_mode_a
 from opengaze.vision.preprocessing import FrameNormalizer
@@ -119,8 +119,10 @@ class GazeKeyboardWindow(QWidget):
             self._detector = _make_detector(config)
             self._owns_detector = True
 
-        self._fx = OneEuroFilter(min_cutoff=0.8, beta=0.07)
-        self._fy = OneEuroFilter(min_cutoff=0.8, beta=0.07)
+        self._mx = TemporalMedianFilter(5)
+        self._my = TemporalMedianFilter(5)
+        self._fx = OneEuroFilter(min_cutoff=0.3, beta=0.1)
+        self._fy = OneEuroFilter(min_cutoff=0.3, beta=0.1)
         self._conf = ConfidenceGate(min_confidence=0.25)
         self._blink = BlinkClickDetector(long_blink_ms=400)
 
@@ -178,8 +180,8 @@ class GazeKeyboardWindow(QWidget):
                     try:
                         s = self._model.predict(fv)
                         t = time.monotonic()
-                        self._gaze_x = _expand(self._fx(s.screen_x_norm, t))
-                        self._gaze_y = _expand(self._fy(s.screen_y_norm, t))
+                        self._gaze_x = _expand(self._fx(self._mx(s.screen_x_norm), t))
+                        self._gaze_y = _expand(self._fy(self._my(s.screen_y_norm), t))
                     except Exception:
                         pass
 
