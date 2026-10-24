@@ -13,7 +13,7 @@ hardware_profile:
       resolution: [1280, 720]  # 720p keeps MediaPipe fast on an 8 GB M2; the sensor supports 1080p
       fps: 30
       rotation_degrees: 0
-      mirror_horizontal: false
+      mirror_horizontal: true
       mounting_position: display_top
 
   calibration:
