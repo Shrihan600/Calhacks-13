@@ -120,7 +120,8 @@ class CalibrationWindow(QWidget):
         self.session = CalibrationSession(
             schema_id=self._schema_id,
             targets=GRID_9,
-            collect_duration_s=config.diagnostics.preview_fps and 1.5 or 1.5,
+            collect_duration_s=1.5,
+            settle_time_s=0.35,  # discard first 350ms — eye still in saccade to dot
         )
 
         # State
