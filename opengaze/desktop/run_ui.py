@@ -33,7 +33,7 @@ from opengaze.config.loader import ProfileReport
 from opengaze.config.schema import AppConfig
 from opengaze.control.blink import BlinkClickDetector
 from opengaze.control.filter import OneEuroFilter
-from opengaze.control.safety import ConfidenceGate, JumpDetector
+from opengaze.control.safety import ConfidenceGate
 from opengaze.modes import TrackingMode, infer_mode
 from opengaze.vision.feature_extractor import build_mode_a
 from opengaze.vision.observations import EyeObservation, HeadObservation
@@ -101,7 +101,6 @@ class GazeTestWindow(QWidget):
         self._filter_x = OneEuroFilter(min_cutoff=0.8, beta=0.07)
         self._filter_y = OneEuroFilter(min_cutoff=0.8, beta=0.07)
         self._conf_gate = ConfidenceGate(min_confidence=0.25)
-        self._jump = JumpDetector(max_jump_norm=0.2)
         self._blink = BlinkClickDetector(long_blink_ms=400, short_blink_ms=180)
 
         # Cursor driver (optional)
@@ -197,10 +196,6 @@ class GazeTestWindow(QWidget):
                 continue
 
             self._confidence = sample.confidence
-
-            if not self._jump.allow(sample.screen_x_norm, sample.screen_y_norm):
-                continue
-
             t = time.monotonic()
             sx = self._filter_x(sample.screen_x_norm, t)
             sy = self._filter_y(sample.screen_y_norm, t)
@@ -236,7 +231,6 @@ class GazeTestWindow(QWidget):
             if not self._paused:
                 self._filter_x.reset()
                 self._filter_y.reset()
-                self._jump.reset()
         elif k == Qt.Key.Key_Tab:
             self._cursor_enabled = not self._cursor_enabled
             state = "ON" if self._cursor_enabled else "OFF"
@@ -262,7 +256,6 @@ class GazeTestWindow(QWidget):
         self._load_model()
         self._filter_x.reset()
         self._filter_y.reset()
-        self._jump.reset()
         self._timer.start()
 
     # ------------------------------------------------------------------
