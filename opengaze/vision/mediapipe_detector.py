@@ -75,12 +75,11 @@ class FaceLandmarkDetector:
     def __init__(self, model_path: Path | None = None) -> None:
         try:
             import mediapipe as mp
-            from mediapipe.tasks.python.core import BaseOptions
-            from mediapipe.tasks.python.vision import (
-                FaceLandmarker,
-                FaceLandmarkerOptions,
-                RunningMode,
-            )
+            from mediapipe.tasks.python import vision as mp_vision
+            BaseOptions = mp.tasks.BaseOptions
+            FaceLandmarker = mp_vision.FaceLandmarker
+            FaceLandmarkerOptions = mp_vision.FaceLandmarkerOptions
+            RunningMode = mp_vision.RunningMode
         except ImportError as exc:
             raise ImportError(
                 "mediapipe is required for face tracking. "

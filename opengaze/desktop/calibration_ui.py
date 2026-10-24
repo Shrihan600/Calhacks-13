@@ -109,9 +109,9 @@ class CalibrationWindow(QWidget):
         from opengaze.modes import infer_mode, TrackingMode
         mode = infer_mode({cam.role for cam in report.profile.enabled_cameras.values()})
         schema_map = {
-            TrackingMode.A: "A-webcam",
-            TrackingMode.B: "B-single-eye",
-            TrackingMode.C: "C-dual-eye",
+            TrackingMode.WEBCAM_ONLY: "A-webcam",
+            TrackingMode.SINGLE_EYE: "B-single-eye",
+            TrackingMode.DUAL_EYE: "C-dual-eye",
         }
         self._schema_id = schema_map.get(mode, "A-webcam")
 

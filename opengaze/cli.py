@@ -207,9 +207,9 @@ def cmd_calibration_info(args: argparse.Namespace) -> int:
     assert report.profile is not None
     mode = infer_mode({cam.role for cam in report.profile.enabled_cameras.values()})
     schema_map = {
-        TrackingMode.A: "A-webcam",
-        TrackingMode.B: "B-single-eye",
-        TrackingMode.C: "C-dual-eye",
+        TrackingMode.WEBCAM_ONLY: "A-webcam",
+        TrackingMode.SINGLE_EYE: "B-single-eye",
+        TrackingMode.DUAL_EYE: "C-dual-eye",
     }
     schema_id = schema_map.get(mode, "A-webcam")  # type: ignore[arg-type]
     store = CalibrationStore()
