@@ -36,7 +36,7 @@ from opengaze.consumer.settings_window import SettingsHooks, SettingsWindow
 from opengaze.consumer.setup_window import SetupHooks, SetupWindow
 from opengaze.consumer.voice_typing import VoiceTyping
 from opengaze.consumer.warning_banner import WarningBanner
-from opengaze.desktop.macwin import KEY_D, KEY_G, CtrlOptHotkeys, become_accessory_app
+from opengaze.desktop.macwin import KEY_G, KEY_T, CtrlOptHotkeys, become_accessory_app
 from opengaze.desktop.run_ui import _launching_app
 from opengaze.voice.cartesia import CartesiaConfig
 from opengaze.voice.service import VoiceService
@@ -101,6 +101,7 @@ class EyeMouseApp:
             status=lambda: self.engine.status,
             set_gaze=self.set_gaze,
             toggle_pause=self.toggle_pause,
+            toggle_tracking=self.toggle_tracking,
             voice_on=lambda: self.settings.voice_typing,
             set_voice=self.set_voice,
             keyboard=self.toggle_keyboard,
@@ -111,7 +112,7 @@ class EyeMouseApp:
         ))
         self.hotkeys = CtrlOptHotkeys({
             KEY_G: self.toggle_pause,
-            KEY_D: lambda: self.voice_typing.toggle(),
+            KEY_T: self.toggle_tracking,
         })
         self.setup: SetupWindow | None = None
         self.settings_window: SettingsWindow | None = None
@@ -298,6 +299,16 @@ class EyeMouseApp:
 
     def toggle_pause(self) -> None:
         self.engine.toggle()
+        self.menu.refresh()
+
+    def toggle_tracking(self) -> None:
+        """The hard off switch, for when tracking is too bad to trust: stop the gaze loop so
+        nothing moves or clicks, and no stray gesture can resume it. Pressed again, it restarts
+        from the saved calibration."""
+        if self.engine.running:
+            self.engine.stop_cursor()
+        else:
+            self._resume_cursor()
         self.menu.refresh()
 
     def set_voice(self, on: bool) -> None:

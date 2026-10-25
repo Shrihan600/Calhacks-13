@@ -413,8 +413,10 @@ def test_banner_and_menu_show_the_problem(qapp):
     assert not banner.isVisible()
 
     shown: list[Problem | None] = [problem]
-    hooks = MenuHooks(gaze_on=lambda: True, status=lambda: "tracking", set_gaze=lambda on: None,
-                      toggle_pause=lambda: None, voice_on=lambda: False,
+    status = ["tracking"]
+    hooks = MenuHooks(gaze_on=lambda: True, status=lambda: status[0], set_gaze=lambda on: None,
+                      toggle_pause=lambda: None, toggle_tracking=lambda: None,
+                      voice_on=lambda: False,
                       set_voice=lambda on: None, keyboard=lambda: None,
                       recalibrate=lambda: None, settings=lambda: None, quit=lambda: None,
                       problem=lambda: shown[0])
@@ -425,6 +427,12 @@ def test_banner_and_menu_show_the_problem(qapp):
     shown[0] = None
     menu.refresh()
     assert not menu.note.isVisible()
+
+    assert menu.tracking.text() == "Stop tracking" and menu.pause.isEnabled()
+    status[0] = "off"  # ⌃⌥T: the gaze loop is stopped, so pausing means nothing
+    menu.refresh()
+    assert menu.tracking.text() == "Start tracking" and not menu.pause.isEnabled()
+    assert menu.status.text() == "Tracking off"
 
 
 def test_setup_runs_again_on_other_hardware(tmp_path):

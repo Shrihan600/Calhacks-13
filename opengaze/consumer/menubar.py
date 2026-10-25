@@ -5,6 +5,7 @@
     ⚠ Glasses not connected     (only while there's a problem)
     ─────────────
     Pause                  ⌃⌥G
+    Stop tracking          ⌃⌥T
     Voice typing             ✓
     Gaze keyboard
     ─────────────
@@ -33,6 +34,7 @@ STATUS_TEXT: dict[GazeStatus, str] = {
     "no_face": "Looking for your face",
     "mouse": "Mouse in control",
     "paused": "Paused",
+    "off": "Tracking off",
 }
 
 
@@ -42,6 +44,7 @@ class MenuHooks:
     status: Callable[[], GazeStatus]
     set_gaze: Callable[[bool], None]
     toggle_pause: Callable[[], None]
+    toggle_tracking: Callable[[], None]
     voice_on: Callable[[], bool]
     set_voice: Callable[[bool], None]
     keyboard: Callable[[], None]
@@ -66,6 +69,9 @@ class MenuBar:
         # is the global hotkey; the menu only shows it.
         self.pause.setShortcut(QKeySequence("Meta+Alt+G"))
         self.pause.triggered.connect(hooks.toggle_pause)
+        self.tracking = QAction("Stop tracking", menu)
+        self.tracking.setShortcut(QKeySequence("Meta+Alt+T"))
+        self.tracking.triggered.connect(hooks.toggle_tracking)
         self.voice = QAction("Voice typing", menu, checkable=True)
         self.voice.triggered.connect(hooks.set_voice)
         keyboard = QAction("Gaze keyboard", menu)
@@ -76,8 +82,8 @@ class MenuBar:
         settings.triggered.connect(hooks.settings)
         quit_ = QAction(f"Quit {theme.APP_NAME}", menu)
         quit_.triggered.connect(hooks.quit)
-        for item in (self.gaze, self.status, self.note, None, self.pause, self.voice, keyboard,
-                     None, recal, settings, quit_):
+        for item in (self.gaze, self.status, self.note, None, self.pause, self.tracking,
+                     self.voice, keyboard, None, recal, settings, quit_):
             if item is None:
                 menu.addSeparator()
             else:
@@ -106,6 +112,8 @@ class MenuBar:
         self.note.setText(f"⚠ {problem.title}" if problem else "")
         self.note.setVisible(problem is not None)
         self.pause.setText("Resume" if status == "paused" else "Pause")
+        self.pause.setEnabled(status != "off")
+        self.tracking.setText("Start tracking" if status == "off" else "Stop tracking")
         self.voice.setChecked(self._hooks.voice_on())
         self.tray.setToolTip(f"{theme.APP_NAME}: "
                              + (problem.title if problem else STATUS_TEXT[status]))

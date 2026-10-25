@@ -17,7 +17,7 @@ _STATUS_LEVEL = 25  # NSStatusWindowLevel: above normal and floating windows
 
 # NSEvent modifier flags and key codes (US layout positions).
 _CTRL, _OPT, _CMD = 1 << 18, 1 << 19, 1 << 20
-KEY_S, KEY_D, KEY_G = 1, 2, 5
+KEY_S, KEY_D, KEY_G, KEY_T = 1, 2, 5, 17
 
 
 def float_everywhere(widget: QWidget, *, click_through: bool = False) -> None:

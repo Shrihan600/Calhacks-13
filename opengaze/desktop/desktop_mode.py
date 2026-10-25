@@ -52,7 +52,8 @@ _PAD = _R + 8    # repaint margin
 # Show "face not found" only after this long, so ordinary blinks don't flicker it.
 _NO_FACE_WARN_S = 1.0
 
-GazeStatus = Literal["tracking", "no_face", "mouse", "paused"]
+# "off": the gaze loop isn't running at all (EyeMouse's ⌃⌥T), so not even a wink resumes it.
+GazeStatus = Literal["tracking", "no_face", "mouse", "paused", "off"]
 
 
 class GazeCursorOverlay(QWidget):

@@ -143,7 +143,7 @@ class GazeEngine:
 
     @property
     def status(self) -> GazeStatus:
-        return self._overlay.status if self._overlay is not None else "paused"
+        return self._overlay.status if self._overlay is not None else "off"
 
     def shutdown(self) -> None:
         self.stop_cursor()

@@ -173,7 +173,7 @@ class VoiceTyping:
             self.pill.hide()
 
     def toggle(self) -> None:
-        """Start or stop listening (the mic button, a triple blink, ⌃⌥D)."""
+        """Start or stop listening (the mic button or a triple blink)."""
         if not self.enabled:
             self._say("Voice typing is off. Turn it on in the menu bar.")
             return

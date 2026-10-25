@@ -140,10 +140,13 @@ cursor is live: double blink a circle, right wink a card, hold a left wink to dr
 
 **Every day:** the gaze cursor drives the pointer in every app. The menu bar item has the
 gaze switch and its status (*Tracking well*, *Looking for your face*, *Mouse in control*,
-*Paused*), Pause (⌃⌥G), Voice typing, Gaze keyboard, Recalibrate and Settings.
+*Paused*, *Tracking off*), Pause (⌃⌥G), Stop tracking (⌃⌥T), Voice typing, Gaze keyboard,
+Recalibrate and Settings. Pause still listens for the long right wink that resumes; when
+tracking is too bad to trust, ⌃⌥T stops the gaze loop outright (no cursor, clicks or
+gestures) until you press it again. The voice typing mic keeps working meanwhile.
 
 - **Voice typing:** when a text field has focus, a mic floats beside the caret (found through
-  the Accessibility API). Click it, triple blink or press ⌃⌥D, then speak; the words are typed
+  the Accessibility API). Click it or triple blink, then speak; the words are typed
   at the caret. Needs the microphone, `CARTESIA_API_KEY`, and the "Allow microphone" consent
   in setup (which turns on Cartesia for EyeMouse only).
 - **Gaze keyboard:** a dark panel along the bottom of the screen. It never takes focus, so it
