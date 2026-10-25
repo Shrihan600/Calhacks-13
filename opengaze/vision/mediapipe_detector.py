@@ -22,6 +22,7 @@ from opengaze.vision.head_pose import (
     MP_LEFT_IRIS,
     MP_RIGHT_EYE_OUTER,
     MP_RIGHT_IRIS,
+    RigidFaceFit,
     estimate_from_landmarks,
     focal_px,
 )
@@ -49,12 +50,61 @@ _BLINK_THRESHOLD = 0.4  # blendshape score above this counts as a blink
 _WINK_MARGIN = 0.25
 
 
-def closed_from_scores(left: float, right: float) -> tuple[bool, bool]:
+def closed_from_scores(
+    left: float,
+    right: float,
+    threshold_left: float = _BLINK_THRESHOLD,
+    threshold_right: float = _BLINK_THRESHOLD,
+) -> tuple[bool, bool]:
     """(left closed, right closed) from the two eyes' blink scores (0 = open, 1 = closed)."""
     return (
-        left > _BLINK_THRESHOLD and right - left < _WINK_MARGIN,
-        right > _BLINK_THRESHOLD and left - right < _WINK_MARGIN,
+        left > threshold_left and right - left < _WINK_MARGIN,
+        right > threshold_right and left - right < _WINK_MARGIN,
     )
+
+
+class EyeClosure:
+    """Eye closure from blink scores, adapted to the user and free of flicker.
+
+    * Baseline: an open eye's score isn't 0 for everyone (narrow or hooded eyes, glasses,
+      looking down at the keyboard), so a fixed threshold misses or invents blinks. Each
+      eye's open baseline follows its low scores quickly and its high ones slowly, and scores
+      are rescaled so that baseline → 0 and fully closed → 1.
+    * Hysteresis: a closed eye opens again only below a lower threshold. Without it a score
+      wavering at the threshold splits one blink into two, which is a double blink: a click.
+
+    Rates are per frame and assume ~30 fps.
+    """
+
+    CLOSE_AT = 0.35  # rescaled score above which an open eye closes
+    OPEN_AT = 0.2  # rescaled score below which a closed eye opens
+    MAX_BASELINE = 0.5  # else a long squint would leave no room for a blink
+
+    def __init__(self) -> None:
+        self._base: dict[str, float] = {}  # set from the first frame
+        self._closed = {"left": False, "right": False}
+
+    def rescaled(self, side: str, score: float) -> float:
+        b = self._base.setdefault(side, min(score, self.MAX_BASELINE))
+        return min(1.0, max(0.0, (score - b) / (1.0 - b)))
+
+    def update(self, left: float, right: float) -> tuple[bool, bool]:
+        """(left closed, right closed) from this frame's raw blink scores."""
+        nl, nr = self.rescaled("left", left), self.rescaled("right", right)
+        thr = {s: self.OPEN_AT if self._closed[s] else self.CLOSE_AT for s in self._closed}
+        cl, cr = closed_from_scores(nl, nr, thr["left"], thr["right"])
+        self._closed = {"left": cl, "right": cr}
+        for side, score in (("left", left), ("right", right)):
+            # Rising slowly even while closed: a held wink (a drag) still reads as closed at
+            # the capped baseline, and a user whose open eyes score high doesn't stay "closed".
+            b = self._base[side]
+            b += (0.2 if score < b else 0.004) * (score - b)  # rising: ~8 s time constant
+            self._base[side] = min(b, self.MAX_BASELINE)
+        return cl, cr
+
+    def lost(self) -> None:
+        """The face is gone: nothing is known about the eyes (baselines are kept)."""
+        self._closed = {"left": False, "right": False}
 
 
 def default_model_path() -> Path:
@@ -124,6 +174,8 @@ class FaceLandmarkDetector:
         )
         self._landmarker = FaceLandmarker.create_from_options(options)
         self._last_timestamp_ms: int = -1
+        self.face_fit = RigidFaceFit()
+        self.closure = EyeClosure()
 
     def detect(
         self, frame: CameraFrame
@@ -138,7 +190,9 @@ class FaceLandmarkDetector:
         timestamp_ms = max(frame.timestamp_ns // 1_000_000, self._last_timestamp_ms + 1)
         self._last_timestamp_ms = timestamp_ms
         result = self._landmarker.detect_for_video(mp_image, timestamp_ms)
-        return _parse_result(result, frame, self.mirrored, self.hfov_deg)
+        return _parse_result(
+            result, frame, self.mirrored, self.hfov_deg, self.face_fit, self.closure
+        )
 
     def close(self) -> None:
         self._landmarker.close()
@@ -173,8 +227,12 @@ def _parse_result(
     frame: CameraFrame,
     mirrored: bool,
     hfov_deg: float,
+    face_fit: RigidFaceFit | None = None,
+    closure: EyeClosure | None = None,
 ) -> tuple[HeadObservation | None, list[EyeObservation]]:
     if not result.face_landmarks:
+        if closure is not None:
+            closure.lost()
         return None, []
 
     landmarks = result.face_landmarks[0]
@@ -191,7 +249,7 @@ def _parse_result(
     else:
         f, pp = focal_px(w, hfov_deg), None
     pose = estimate_from_landmarks(lm, w, h, mirrored=mirrored, focal_length_px=f,
-                                   principal_point=pp)
+                                   principal_point=pp, face_fit=face_fit)
 
     # Blink scores from blendshapes (0 = open, 1 = fully closed), named like the landmarks.
     blink_mp = {"left": 0.0, "right": 0.0}
@@ -213,7 +271,11 @@ def _parse_result(
     iod = float(np.hypot(outer_l.x - outer_r.x, outer_l.y - outer_r.y))
     pupil_radius = iod * 0.07  # iris ≈ 7% of the eye-corner span (heuristic)
 
-    closed_l, closed_r = closed_from_scores(blink_mp["left"], blink_mp["right"])
+    if closure is not None:
+        closed_l, closed_r = closure.update(blink_mp["left"], blink_mp["right"])
+        blink_mp = {s: closure.rescaled(s, v) for s, v in blink_mp.items()}
+    else:
+        closed_l, closed_r = closed_from_scores(blink_mp["left"], blink_mp["right"])
     closed_mp = {"left": closed_l, "right": closed_r}
 
     eyes = []

@@ -42,6 +42,17 @@ DEFAULT_EYE_CORNER_SPAN_CM = 9.0
 # within the eye opening into an eye rotation; calibration fits a gain on top.
 EYE_RADIUS_PER_WIDTH = 0.4
 
+# Landmarks that move with the skull, not with expression: forehead, nose bridge and tip,
+# eye corners, cheekbones and temples. No mouth, jaw (it moves when talking), brows or lids.
+RIGID_LANDMARKS = (
+    10, 151, 9, 8, 168, 6, 197, 195, 5, 4, 1,  # midline: forehead → nose tip
+    67, 297, 109, 338, 54, 284, 103, 332,  # forehead
+    21, 251, 127, 356, 234, 454,  # temples, face sides
+    33, 133, 362, 263,  # eye corners
+    116, 345, 117, 346, 123, 352, 50, 280,  # cheekbones
+    98, 327,  # nostrils
+)
+
 
 def rotation_from_angles(yaw_deg: float, pitch_deg: float, roll_deg: float) -> np.ndarray:
     """Head → world rotation ``Ry(yaw) · Rx(pitch) · Rz(roll)`` (conventions above)."""
@@ -78,6 +89,82 @@ class WebcamHeadPose:
     eye_dirs: dict[str, np.ndarray]
 
 
+def _similarity_fit(
+    a: np.ndarray, b: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """(R, t, scale, rms) minimising Σ‖scale·R·aᵢ + t − bᵢ‖² (Umeyama; rows are points)."""
+    ca, cb = a.mean(axis=0), b.mean(axis=0)
+    a0, b0 = a - ca, b - cb
+    u, sv, vt = np.linalg.svd(a0.T @ b0)
+    d = np.diag([1.0, 1.0, np.sign(np.linalg.det(vt.T @ u.T)) or 1.0])
+    rot = vt.T @ d @ u.T
+    scale = float(np.trace(np.diag(sv) @ d) / np.sum(a0 * a0))
+    t = cb - scale * rot @ ca
+    rms = float(np.sqrt(np.mean(np.sum((scale * a @ rot.T + t - b) ** 2, axis=1))))
+    return rot, t, scale, rms
+
+
+class RigidFaceFit:
+    """Per-user face template for a head pose fitted to all ``RIGID_LANDMARKS``.
+
+    The 4-point pose (eye corners, forehead, chin) carries the full noise of each of those
+    landmarks, and the chin moves whenever the user talks. This learns the user's face shape
+    in the head frame by averaging 4-point poses over the first ``frames`` near-frontal
+    frames; from then on each frame's pose is a similarity fit of that template to ~40
+    landmarks, which averages their noise out. Distance comes from the fitted scale, and the
+    eye centres from the template, instead of from two jittery corners each.
+
+    The template is rebuilt once it stops fitting for a while (someone else sat down).
+    """
+
+    def __init__(self, frames: int = 30, *, max_rms: float = 0.08, max_bad: int = 15) -> None:
+        self.frames = frames
+        self.max_rms = max_rms  # bad fit: rms residual above this × eye-corner span
+        self.max_bad = max_bad  # consecutive bad fits before the template is rebuilt
+        self.reset()
+
+    def reset(self) -> None:
+        self._samples: list[np.ndarray] = []
+        self.template: np.ndarray | None = None  # RIGID_LANDMARKS × 3, head frame, cm
+        self._bad = 0
+
+    @property
+    def ready(self) -> bool:
+        return self.template is not None
+
+    def add_sample(self, head_pts: np.ndarray) -> None:
+        self._samples.append(head_pts)
+        if len(self._samples) >= self.frames:
+            self.template = np.mean(self._samples, axis=0)
+            self._samples = []
+
+    def fit(self, pts: np.ndarray) -> tuple[np.ndarray, np.ndarray, float] | None:
+        """(R, origin, scale) for world points of ``RIGID_LANDMARKS``; None on a bad fit."""
+        assert self.template is not None
+        rot, t, scale, rms = _similarity_fit(self.template, pts)
+        span = float(np.linalg.norm(self.template[_TPL_R_OUTER] - self.template[_TPL_L_OUTER]))
+        if not scale > 0 or rms > self.max_rms * span * scale:
+            self._bad += 1
+            if self._bad >= self.max_bad:
+                self.reset()
+            return None
+        self._bad = 0
+        return rot, t, scale
+
+    def eye(self, outer: int, inner: int) -> tuple[np.ndarray, float]:
+        """(centre, width) of an eye in the template, by its corner landmark indices."""
+        assert self.template is not None
+        o, i = self.template[_RIGID_INDEX[outer]], self.template[_RIGID_INDEX[inner]]
+        return (o + i) / 2.0, float(np.linalg.norm(o - i))
+
+
+_RIGID_INDEX = {lm: i for i, lm in enumerate(RIGID_LANDMARKS)}
+# Either face's outer corners; the span between them doesn't depend on which is which.
+_TPL_R_OUTER, _TPL_L_OUTER = _RIGID_INDEX[MP_RIGHT_EYE_OUTER], _RIGID_INDEX[MP_LEFT_EYE_OUTER]
+# Template samples only from near-frontal poses, where the 4-point pose is most accurate.
+_TEMPLATE_MAX_ANGLE_DEG = 20.0
+
+
 def estimate_from_landmarks(
     landmarks: np.ndarray,
     width: int,
@@ -87,8 +174,13 @@ def estimate_from_landmarks(
     focal_length_px: float,
     principal_point: tuple[float, float] | None = None,
     eye_corner_span_cm: float = DEFAULT_EYE_CORNER_SPAN_CM,
+    face_fit: RigidFaceFit | None = None,
 ) -> WebcamHeadPose | None:
-    """Head rotation, head position and eye-in-head gaze from normalised landmarks (N×3)."""
+    """Head rotation, head position and eye-in-head gaze from normalised landmarks (N×3).
+
+    With ``face_fit`` (and a full face mesh) the pose is a rigid fit of the user's face
+    template once it has been learnt; until then, and without one, it comes from 4 points.
+    """
     lm = np.asarray(landmarks, dtype=np.float64)
     if lm.shape[0] <= max(MP_LEFT_IRIS, MP_RIGHT_IRIS):
         return None
@@ -137,19 +229,38 @@ def estimate_from_landmarks(
     y_axis /= np.linalg.norm(y_axis)
     z_axis = np.cross(x_axis, y_axis)
     rot = np.stack([x_axis, y_axis, z_axis], axis=1)
-    yaw, pitch, roll = angles_from_rotation(rot)
     mid = (pts[r_outer] + pts[l_outer]) / 2.0
+
+    # Eye centre and width in the head frame, per eye (4-point: from this frame's corners).
+    eyes = {
+        side: (rot.T @ ((pts[o] + pts[i]) / 2.0 - mid), float(np.linalg.norm(pts[o] - pts[i])))
+        for side, (o, i, _) in user.items()
+    }
+    rigid = list(RIGID_LANDMARKS)
+    if face_fit is not None and lm.shape[0] > max(RIGID_LANDMARKS):
+        if not face_fit.ready:
+            yaw, pitch, _ = angles_from_rotation(rot)
+            if max(abs(yaw), abs(pitch)) < _TEMPLATE_MAX_ANGLE_DEG:
+                face_fit.add_sample((pts[rigid] - mid) @ rot)
+        elif (fitted := face_fit.fit(pts[rigid])) is not None:
+            # Points scale with the assumed distance: correct it by the fitted scale, refit.
+            distance /= fitted[2]
+            pts = back_project(distance)
+            if (fitted := face_fit.fit(pts[rigid])) is not None:
+                rot, mid = fitted[0], fitted[1]
+                eyes = {side: face_fit.eye(o, i) for side, (o, i, _) in user.items()}
+
+    yaw, pitch, roll = angles_from_rotation(rot)
     position = (float(mid[0]), float(mid[1]), float(mid[2]))
 
     eye_dirs: dict[str, np.ndarray] = {}
-    for side, (outer, inner, iris) in user.items():
-        center = (pts[outer] + pts[inner]) / 2.0
-        eye_width = float(np.linalg.norm(pts[outer] - pts[inner]))
+    for side, (_, _, iris) in user.items():
+        center, eye_width = eyes[side]
         if eye_width < 1e-6:
             continue
-        offset = pts[iris] - center
-        sx = (offset @ x_axis) / eye_width / EYE_RADIUS_PER_WIDTH
-        sy = (offset @ y_axis) / eye_width / EYE_RADIUS_PER_WIDTH
+        offset = rot.T @ (pts[iris] - mid) - center
+        sx = offset[0] / eye_width / EYE_RADIUS_PER_WIDTH
+        sy = offset[1] / eye_width / EYE_RADIUS_PER_WIDTH
         n = math.hypot(sx, sy)
         if n > 0.95:  # clamp implausible rotations instead of producing NaNs
             sx, sy = sx * 0.95 / n, sy * 0.95 / n

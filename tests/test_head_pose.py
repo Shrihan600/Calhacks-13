@@ -17,6 +17,8 @@ from opengaze.vision.head_pose import (
     MP_RIGHT_EYE_INNER,
     MP_RIGHT_EYE_OUTER,
     MP_RIGHT_IRIS,
+    RIGID_LANDMARKS,
+    RigidFaceFit,
     angles_from_rotation,
     estimate_from_landmarks,
     focal_px,
@@ -124,3 +126,91 @@ def test_angles_round_trip():
 def test_too_few_landmarks():
     lm = np.zeros((10, 3))
     assert estimate_from_landmarks(lm, W, H, mirrored=True, focal_length_px=F) is None
+
+
+# --- Rigid face fit -------------------------------------------------------------------
+
+_RNG = np.random.default_rng(7)
+# Skull points of a synthetic face (head frame, cm), keyed like an unmirrored MediaPipe mesh.
+_SKULL = {
+    i: np.array([_RNG.uniform(-7, 7), _RNG.uniform(-8, 6), _RNG.uniform(-4, 3)])
+    for i in RIGID_LANDMARKS
+}
+
+
+def full_landmarks(yaw, pitch, roll, position, *, mirrored, eye_rot=(0.0, 0.0), noise_px=0.0,
+                   rng=None):
+    lm = landmarks(yaw, pitch, roll, position, mirrored=mirrored, eye_rot=eye_rot)
+    rot = rotation_from_angles(yaw, pitch, roll)
+    named = {MP_RIGHT_EYE_OUTER, MP_RIGHT_EYE_INNER, MP_LEFT_EYE_OUTER, MP_LEFT_EYE_INNER,
+             MP_FOREHEAD}
+    ref_depth = -(rot @ np.array([0.0, 0.0, 0.0]) + np.asarray(position))[2]
+    for i, p in _SKULL.items():
+        if i in named:
+            continue
+        if mirrored:  # MediaPipe's landmark lands on the mirror image of the point
+            p = p * np.array([-1.0, 1.0, 1.0])
+        w = rot @ p + np.asarray(position)
+        x_cam, y_cam, z_cam = -w[0], w[1], -w[2]
+        u = F * x_cam / z_cam + W / 2
+        v = F * y_cam / z_cam + H / 2
+        if mirrored:
+            u = W - u
+        lm[i] = (u / W, v / H, (z_cam - ref_depth) * F / ref_depth / W)
+    if noise_px:
+        lm[:, 0] += rng.normal(0, noise_px / W, len(lm))
+        lm[:, 1] += rng.normal(0, noise_px / H, len(lm))
+        lm[:, 2] += rng.normal(0, noise_px / W, len(lm))  # MediaPipe depth is as noisy
+    return lm
+
+
+def _warm_fit(mirrored, fit=None):
+    fit = fit or RigidFaceFit(frames=10)
+    for _ in range(fit.frames):
+        estimate_from_landmarks(full_landmarks(0, 0, 0, (0, 0, -60), mirrored=mirrored),
+                                W, H, mirrored=mirrored, focal_length_px=F, face_fit=fit)
+    assert fit.ready
+    return fit
+
+
+@pytest.mark.parametrize("mirrored", [True, False])
+def test_rigid_fit_recovers_pose_and_eye_direction(mirrored):
+    fit = _warm_fit(mirrored)
+    eye = (math.radians(12), math.radians(-8))
+    for yaw, pitch, roll, pos in [(25, 0, 0, (5, 3, -55)), (-15, 10, 8, (-8, -2, -70))]:
+        lm = full_landmarks(yaw, pitch, roll, pos, mirrored=mirrored, eye_rot=eye)
+        pose = estimate_from_landmarks(lm, W, H, mirrored=mirrored, focal_length_px=F,
+                                       face_fit=fit)
+        assert (pose.yaw_deg, pose.pitch_deg, pose.roll_deg) == pytest.approx(
+            (yaw, pitch, roll), abs=3.0)
+        assert np.allclose(pose.position_cm, pos, atol=3.0)
+        for side in ("left", "right"):
+            assert np.allclose(pose.eye_dirs[side][:2], np.sin(eye), atol=0.05)
+
+
+def test_rigid_fit_reduces_jitter():
+    rng = np.random.default_rng(1)
+    fit = _warm_fit(True)
+    spread = {}
+    for name, ff in (("4-point", None), ("rigid", fit)):
+        rows = []
+        for _ in range(200):
+            lm = full_landmarks(5, -3, 2, (2, 4, -60), mirrored=True, noise_px=1.0, rng=rng)
+            pose = estimate_from_landmarks(lm, W, H, mirrored=True, focal_length_px=F,
+                                           face_fit=ff)
+            rows.append([pose.yaw_deg, pose.pitch_deg, *pose.position_cm,
+                         *pose.eye_dirs["left"][:2]])
+        spread[name] = np.std(rows, axis=0)
+    # Head rotation and position at least twice as steady; eye direction, dominated by the
+    # iris landmark's own noise, a little steadier.
+    assert np.all(spread["rigid"][:5] * 2 < spread["4-point"][:5])
+    assert np.all(spread["rigid"][5:] < spread["4-point"][5:])
+
+
+def test_rigid_fit_rebuilds_for_another_face():
+    fit = _warm_fit(True, RigidFaceFit(frames=10, max_bad=3))
+    fit.template = fit.template * np.array([1.0, 1.6, 0.3])  # nothing like the face seen
+    for _ in range(3):
+        estimate_from_landmarks(full_landmarks(0, 0, 0, (0, 0, -60), mirrored=True),
+                                W, H, mirrored=True, focal_length_px=F, face_fit=fit)
+    assert not fit.ready

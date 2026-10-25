@@ -76,6 +76,22 @@ def test_triple_blink_starts_voice_typing() -> None:
     assert bindings[Gesture.DOUBLE_BLINK].mouse == "click"  # clicking stays a double blink
 
 
+
+def test_fresh_start_ignores_the_saved_calibration(monkeypatch) -> None:
+    from opengaze.config.loader import check_hardware_profile
+    from opengaze.consumer.engine import GazeEngine
+    from tests.helpers import HARDWARE_DIR
+
+    config = load_app_config(REPO_ROOT / "configs" / "default.yaml")
+    report = check_hardware_profile(HARDWARE_DIR / "synthetic-headset.yaml")
+    engine = GazeEngine(report, config, {})
+    monkeypatch.setattr(engine.store, "exists", lambda *a: True)
+    monkeypatch.setattr(engine, "start_camera", lambda: None)
+    assert engine.calibrated
+    engine.ignore_saved_calibration = True  # `opengaze app --fresh`
+    assert not engine.calibrated
+    assert not engine.start_cursor() and not engine.running
+
 def _hooks(calls: list):
     from opengaze.consumer.setup_window import SetupHooks
 
@@ -115,6 +131,22 @@ def test_setup_flow_skipping_voice(qapp, monkeypatch) -> None:
     assert calls[-1] == ("finish", False)
     assert "quit" not in calls  # finishing closes setup without quitting
 
+
+
+def test_try_it_out_can_stop_tracking(qapp) -> None:
+    from opengaze.consumer.setup_window import SetupWindow
+
+    calls: list = []
+    hooks = _hooks(calls)
+    hooks.toggle_tracking = lambda: calls.append("tracking")
+    win = SetupWindow(hooks, open_at_login=True)
+    win.go(SetupWindow.PRACTICE)
+    page = win.practice
+    assert page.tracking.text().startswith("Stop tracking")
+    QTest.mouseClick(page.tracking, Qt.MouseButton.LeftButton)
+    assert calls == ["tracking"]
+    page.set_tracking(False)
+    assert page.tracking.text().startswith("Start tracking")
 
 def test_closing_setup_early_quits(qapp) -> None:
     from opengaze.consumer.setup_window import SetupWindow

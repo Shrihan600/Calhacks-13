@@ -125,6 +125,7 @@ Download the MediaPipe face model (~5 MB, done once):
 ```bash
 .venv/bin/opengaze app          # or: .venv/bin/eyemouse
 .venv/bin/opengaze app --setup  # run setup again
+.venv/bin/opengaze app --fresh  # as if for the first time: setup, no tracking until you calibrate
 ```
 
 The everyday app, built from the consumer design. The developer commands below stay as they are.
@@ -135,7 +136,7 @@ both are) → allow the camera → turn on Accessibility (the page
 moves on by itself once it's on) → allow the microphone or skip voice → 9-dot calibration
 (fullscreen; a poor fit offers *Try again* / *Use it anyway*) → **Try it out**, where the gaze
 cursor is live: double blink a circle, right wink a card, hold a left wink to drag a block.
-**Done** moves EyeMouse to the menu bar and, if ticked, adds a login item
+If tracking is too poor to use, *Stop tracking* (or ⌃⌥T) turns the cursor off. **Done** moves EyeMouse to the menu bar and, if ticked, adds a login item
 (`~/Library/LaunchAgents/com.opengaze.eyemouse.plist`).
 
 **Every day:** the gaze cursor drives the pointer in every app. The menu bar item has the

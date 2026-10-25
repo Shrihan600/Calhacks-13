@@ -187,11 +187,6 @@ class EyeMouseCalibration(CalibrationWindow):
                 self._paint_hint(p, c, "Hold still and look at the dot")
         else:
             self._paint_ring_target(p, c, 1.0, self.session.collect_progress)
-        p.setPen(theme.qcolor(theme.MUTED))
-        p.setFont(theme.text_font(15, 600))
-        n = self.session.n_targets
-        p.drawText(QRect(0, self.height() - 120, self.width(), 24), Qt.AlignmentFlag.AlignCenter,
-                   f"{min(self._current_point + 1, n)} of {n}")
 
     def _paint_hint(self, p: QPainter, c: QPointF, text: str) -> None:
         p.setFont(theme.text_font(16, 600))

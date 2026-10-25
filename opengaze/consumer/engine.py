@@ -65,6 +65,8 @@ class GazeEngine:
         self._camera_started = 0.0
         self._tracker: GazeTracker | None = None
         self._overlay: EyeMouseOverlay | None = None
+        # `opengaze app --fresh`: act as if there's no calibration until one is saved this run.
+        self.ignore_saved_calibration = False
 
     # -- camera ------------------------------------------------------------
 
@@ -93,6 +95,8 @@ class GazeEngine:
 
     @property
     def calibrated(self) -> bool:
+        if self.ignore_saved_calibration:
+            return False
         return self.store.exists(self.schema_id, self.report.profile)  # type: ignore[arg-type]
 
     # -- cursor ------------------------------------------------------------
@@ -105,6 +109,8 @@ class GazeEngine:
         """Follow gaze with the real cursor, from the saved calibration. False if there's none."""
         self.stop_cursor()
         runtime = self.start_camera()
+        if self.ignore_saved_calibration:
+            return False
         try:
             bundle = self.store.load_bundle(self.schema_id, self.report.profile)  # type: ignore[arg-type]
         except (FileNotFoundError, ValueError) as exc:

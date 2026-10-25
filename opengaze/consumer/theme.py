@@ -108,7 +108,17 @@ def svg_pixmap(svg: str, width: int, height: int, dpr: float = 2.0) -> QPixmap:
 
 
 def app_icon() -> QIcon:
-    return QIcon(svg_pixmap(LOGO_SVG, 256, 256))
+    """The Dock icon: the logo tile inset on Apple's icon grid (824 of 1024 px), so it sits
+    the same size as other apps' icons instead of filling the whole canvas."""
+    size, tile = 1024, 824
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    inset = (size - tile) / 2
+    QSvgRenderer(QByteArray(LOGO_SVG.encode())).render(p, QRectF(inset, inset, tile, tile))
+    p.end()
+    return QIcon(pm)
 
 
 def menu_bar_icon() -> QIcon:

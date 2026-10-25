@@ -86,6 +86,8 @@ class EyeMouseApp:
         self.login_item = LoginItem()
         self._login_program = [sys.executable, "-m", "opengaze.cli", "app", *(login_args or [])]
         self._everyday = False
+        # Tracking turned off (⌃⌥T) in Try it out stays off into every day.
+        self._tracking_off = False
 
         later = self._later
         self.engine = GazeEngine(report, config, {
@@ -213,6 +215,7 @@ class EyeMouseApp:
                 has_voice_key=CartesiaConfig.from_env() is not None,
                 permission_app=_permission_app(),
                 scan_glasses=self.scan_glasses if self.uses_glasses() else None,
+                toggle_tracking=self.toggle_tracking,
             ), self.settings.open_at_login)
             self.setup.go(SetupWindow.WELCOME)
         self.setup.show()
@@ -228,7 +231,10 @@ class EyeMouseApp:
         assert self.setup is not None
         if saved or self.engine.calibrated:
             self.engine.start_cursor()
+            self._tracking_off = False
             self.setup.go(SetupWindow.PRACTICE)
+            self.setup.practice.set_tracking(self.engine.running)
+            self.hotkeys.install()  # ⌃⌥G / ⌃⌥T work from Try it out on
         else:
             self.setup.go(SetupWindow.MIC)
         self.setup.show()
@@ -258,6 +264,8 @@ class EyeMouseApp:
         def done(outcome: Outcome) -> None:
             self._calibration = None
             self._sync_banner()
+            if outcome == "saved":
+                self.engine.ignore_saved_calibration = False
             if outcome == "retry":
                 QTimer.singleShot(0, lambda: self.calibrate(then))
             else:
@@ -285,7 +293,7 @@ class EyeMouseApp:
         self._everyday = True
         request_camera_permission()
         become_accessory_app()
-        if not self.engine.running:
+        if not self.engine.running and not self._tracking_off:
             self.engine.start_cursor()
         self.voice_typing.set_enabled(self.settings.voice_typing)
         self.menu.show()
@@ -298,6 +306,8 @@ class EyeMouseApp:
         self.menu.refresh()
 
     def toggle_pause(self) -> None:
+        if self._calibration is not None:
+            return
         self.engine.toggle()
         self.menu.refresh()
 
@@ -305,11 +315,16 @@ class EyeMouseApp:
         """The hard off switch, for when tracking is too bad to trust: stop the gaze loop so
         nothing moves or clicks, and no stray gesture can resume it. Pressed again, it restarts
         from the saved calibration."""
+        if self._calibration is not None:
+            return  # calibrating has the camera; the cursor comes back when it's done
         if self.engine.running:
             self.engine.stop_cursor()
         else:
             self._resume_cursor()
+        self._tracking_off = not self.engine.running
         self.menu.refresh()
+        if self.setup is not None:
+            self.setup.practice.set_tracking(self.engine.running)
 
     def set_voice(self, on: bool) -> None:
         if on != self.settings.voice_typing:
@@ -351,9 +366,16 @@ def run_app(
     config: AppConfig,
     *,
     force_setup: bool = False,
+    fresh: bool = False,
     login_args: list[str] | None = None,
 ) -> int:
-    return EyeMouseApp(report, config, login_args=login_args).run(force_setup)
+    """``fresh`` starts as if for the first time: default settings and setup, and no gaze
+    tracking from the saved calibration until a new one is saved. Nothing is deleted, but the
+    settings file is rewritten as setup goes, as on a real first run."""
+    app = EyeMouseApp(report, config, login_args=login_args,
+                      settings=AppSettings() if fresh else None)
+    app.engine.ignore_saved_calibration = fresh
+    return app.run(force_setup or fresh)
 
 
 def show_startup_error(title: str, detail: str) -> None:

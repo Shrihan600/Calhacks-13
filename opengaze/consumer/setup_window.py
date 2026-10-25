@@ -53,6 +53,7 @@ GESTURE_GUIDE = [
     (True, False, "Long right wink", "Pause"),
 ]
 PAUSE_SHORTCUT = "⌃⌥G"
+TRACKING_SHORTCUT = "⌃⌥T"
 
 
 def open_privacy_pane(pane: str) -> None:
@@ -82,6 +83,8 @@ class SetupHooks:
     permission_app: str              # whose permissions macOS checks (us, or the terminal)
     # Finds the glasses. None: a developer's webcam-only profile, so there's nothing to connect.
     scan_glasses: Callable[[], Scan] | None = None
+    # Turns the gaze cursor off or back on while trying it out (the app's ⌃⌥T).
+    toggle_tracking: Callable[[], None] = lambda: None
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +616,7 @@ class GestureList(QWidget):
 
 class PracticePage(QWidget):
     def __init__(self, redo: Callable[[], None], done: Callable[[bool], None],
-                 open_at_login: bool) -> None:
+                 open_at_login: bool, toggle_tracking: Callable[[], None]) -> None:
         super().__init__()
         self.setObjectName("page")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
@@ -633,6 +636,10 @@ class PracticePage(QWidget):
         cal.addWidget(_label("Calibrated", "note", wrap=False))
         cal.addWidget(_button("Redo", "link", redo))
         cal.addStretch(1)
+        # A way out when tracking is too bad to use: no cursor, clicks or gestures.
+        self.tracking = _button("", "link", toggle_tracking)
+        cal.addWidget(self.tracking)
+        self.set_tracking(True)
         left.addLayout(cal)
         left.addSpacing(14)
         title = _label("Try it out", "title")
@@ -666,6 +673,9 @@ class PracticePage(QWidget):
         footer.addStretch(1)
         footer.addWidget(_button("Done", "primary", lambda: done(self.login.isChecked())))
         outer.addLayout(footer)
+
+    def set_tracking(self, on: bool) -> None:
+        self.tracking.setText(f"{'Stop' if on else 'Start'} tracking  {TRACKING_SHORTCUT}")
 
     def _after_setup(self, open_at_login: bool) -> QWidget:
         box = QFrame()
@@ -730,7 +740,7 @@ class SetupWindow(QWidget):
             CameraPage(hooks, lambda: go(before_camera), lambda: go(self.ACCESS)),
             AccessibilityPage(hooks, lambda: go(self.CAMERA), lambda: go(self.MIC)),
             MicrophonePage(hooks, lambda: go(self.ACCESS), hooks.calibrate),
-            PracticePage(hooks.calibrate, self._done, open_at_login),
+            PracticePage(hooks.calibrate, self._done, open_at_login, hooks.toggle_tracking),
         ]
         for page in self.pages:
             self.stack.addWidget(page)
