@@ -114,6 +114,7 @@ class CalibrationWindow(QWidget):
             schema_id=self._schema_id,
             targets=GRID_9,
             collect_duration_s=1.5,
+            settle_time_s=0.35,  # discard first 350ms — eye still in saccade to dot
             mapper_factory=self._mapper_factory,
         )
         self._records: dict[int, list[TrackerFrame]] = {}
@@ -178,7 +179,12 @@ class CalibrationWindow(QWidget):
         frame = self.tracker.step(self.runtime.manager)
         if frame.features is None:
             return
-        if self.session.add_sample(frame.features):
+        # Keep the frame only if the sample was stored (not during the settle window, nor a
+        # wrong schema), so frames and samples stay paired for refeature() in _finish.
+        point = self.session.points[self._current_point]
+        before = point.n_samples
+        self.session.add_sample(frame.features)
+        if point.n_samples > before:
             self._records.setdefault(self._current_point, []).append(frame)
 
     def _start_collecting(self) -> None:

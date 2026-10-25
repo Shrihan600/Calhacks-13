@@ -118,6 +118,7 @@ class CalibrationSession:
         targets: tuple[tuple[float, float], ...] = GRID_9,
         min_samples_per_point: int = 15,
         collect_duration_s: float = 1.5,
+        settle_time_s: float = 0.0,
         alpha: float = 1.0,
         mapper_factory: MapperFactory | None = None,
     ) -> None:
@@ -126,6 +127,7 @@ class CalibrationSession:
         self.targets = targets
         self.min_samples_per_point = min_samples_per_point
         self.collect_duration_s = collect_duration_s
+        self.settle_time_s = settle_time_s  # skip this many seconds after dot appears
         self._alpha = alpha
         self._mapper_factory = mapper_factory or (
             lambda: GazeModel(schema_id=self.schema_id, alpha=self._alpha)
@@ -150,8 +152,11 @@ class CalibrationSession:
         if self._current_index is None or self._collect_start is None:
             return False
         elapsed = time.monotonic() - self._collect_start
-        if elapsed > self.collect_duration_s:
+        total = self.settle_time_s + self.collect_duration_s
+        if elapsed > total:
             return False
+        if elapsed < self.settle_time_s:
+            return True  # eye still moving to the dot — discard frame, keep timer running
         if fv.schema_id != self.schema_id:
             return True  # wrong schema — skip silently, keep collecting
         self.points[self._current_index].samples.append(fv)
@@ -169,15 +174,17 @@ class CalibrationSession:
     def collecting(self) -> bool:
         if self._current_index is None or self._collect_start is None:
             return False
-        return (time.monotonic() - self._collect_start) <= self.collect_duration_s
+        total = self.settle_time_s + self.collect_duration_s
+        return (time.monotonic() - self._collect_start) <= total
 
     @property
     def collect_progress(self) -> float:
-        """0.0 → 1.0 fraction of collect_duration_s elapsed for the current point."""
+        """0.0 → 1.0 fill fraction for the dwell ring (covers settle + collect window)."""
         if self._current_index is None or self._collect_start is None:
             return 0.0
         elapsed = time.monotonic() - self._collect_start
-        return min(elapsed / self.collect_duration_s, 1.0)
+        total = self.settle_time_s + self.collect_duration_s
+        return min(elapsed / total, 1.0)
 
     # ------------------------------------------------------------------
     # Fitting
