@@ -39,7 +39,9 @@ def _load(args: argparse.Namespace) -> tuple[AppConfig, ProfileReport]:
     config = _with_cloud_flag(load_app_config(args.config), args)
     configure_logging(args.log_level or config.app.log_level)
     profile_path = Path(args.profile) if args.profile else config.app.hardware_profile
-    report = check_hardware_profile(profile_path, [Path(p) for p in args.overlay])
+    report = check_hardware_profile(
+        profile_path, [Path(p) for p in args.overlay], getattr(args, "set", [])
+    )
     return config, report
 
 
@@ -69,11 +71,10 @@ def ensure_camera_permission(report: ProfileReport) -> None:
     """Ask for macOS camera access on the main thread if any live camera is configured."""
     from opengaze.cameras.permissions import GUIDANCE, request_camera_permission
     from opengaze.cameras.registry import get_source_class
-    from opengaze.cameras.types import SourceKind
 
     assert report.profile is not None
     cameras = report.profile.enabled_cameras.values()
-    if any(get_source_class(c.source_type).source_kind is SourceKind.LIVE for c in cameras):
+    if any(get_source_class(c.source_type).needs_camera_permission for c in cameras):
         status = request_camera_permission()
         if status in GUIDANCE:
             print(f"camera permission: {status.value}. {GUIDANCE[status]}")
@@ -81,7 +82,9 @@ def ensure_camera_permission(report: ProfileReport) -> None:
 
 def cmd_validate(args: argparse.Namespace) -> int:
     configure_logging(args.log_level or "WARNING")
-    report = check_hardware_profile(Path(args.profile_path), [Path(p) for p in args.overlay])
+    report = check_hardware_profile(
+        Path(args.profile_path), [Path(p) for p in args.overlay], args.set
+    )
     _print_report(report)
     return 0 if report.ok else 1
 
@@ -97,12 +100,23 @@ def cmd_diagnostics(args: argparse.Namespace) -> int:
         print(f"desktop UI unavailable ({exc}); install with: pip install -e '.[desktop]'")
         return 1
     ensure_camera_permission(report)
-    return run_diagnostics(report, config)
+    return run_diagnostics(report, config, metrics=_metrics_recorder(args))
+
+
+def _metrics_recorder(args: argparse.Namespace):
+    from opengaze.debug.metrics import MetricsRecorder
+
+    if args.metrics is None:
+        return None
+    path = MetricsRecorder.default_path() if args.metrics == "auto" else Path(args.metrics)
+    return MetricsRecorder(path, interval_s=args.metrics_interval)
 
 
 def cmd_headless(args: argparse.Namespace) -> int:
-    """Run capture without a UI and print camera health — handy over SSH or in CI."""
-    from opengaze.cameras.manager import CameraManager
+    """Run capture without a UI and print camera + IMU health — handy over SSH or in CI."""
+    from opengaze.cameras.manager import CameraManager, is_emulated
+    from opengaze.debug.metrics import input_statuses
+    from opengaze.imu.runtime import start_profile_imu
 
     config, report = _load(args)
     if not report.ok:
@@ -111,33 +125,120 @@ def cmd_headless(args: argparse.Namespace) -> int:
     assert report.profile is not None
     ensure_camera_permission(report)
     manager = CameraManager.from_profile(report.profile, config.capture)
+    imu = start_profile_imu(report.profile)
+    recorder = _metrics_recorder(args)
 
     async def monitor() -> None:
         task = asyncio.create_task(manager.run())
         deadline = time.monotonic() + args.seconds
+        next_print = time.monotonic() + args.interval
         header = (
             f"{'camera':10} {'kind':9} {'state':12} {'fps':>6} {'age ms':>7} {'frames':>7} "
             f"{'skip':>5} {'over':>5} {'part':>5} {'recon':>5}  last error"
         )
         while time.monotonic() < deadline:
-            await asyncio.sleep(args.interval)
+            await asyncio.sleep(min(0.25, args.interval))
+            health = manager.health()
+            imu_health = imu.health() if imu is not None else None
+            if recorder is not None:
+                recorder.record(health, imu_health)
+            if time.monotonic() < next_print:
+                continue
+            next_print += args.interval
             print(header)
-            for h in manager.health().values():
+            for h in health.values():
+                kind = "emulated" if is_emulated(h) else h.source_kind.value
                 fps = f"{h.measured_fps:6.1f}" if h.measured_fps else "     —"
                 age = (
                     f"{h.last_frame_age_ms:7.0f}" if h.last_frame_age_ms is not None else "      —"
                 )
                 print(
-                    f"{h.camera_id:10} {h.source_kind.value:9} {h.state.value:12} {fps} {age} "
+                    f"{h.camera_id:10} {kind:9} {h.state.value:12} {fps} {age} "
                     f"{h.frames_received:7} {h.frames_skipped_by_source:5} "
                     f"{h.frames_overwritten:5} {h.partial_frames:5} {h.reconnects:5}  "
                     f"{h.last_error or ''}"
                 )
+            if imu_health is not None:
+                print(_format_imu(imu, imu_health))
+            print("inputs: " + "  ".join(
+                f"{s.name} {s.level.upper()} ({s.detail})"
+                for s in input_statuses(health, imu_health)
+            ))
             print()
         await manager.stop()
         await task
 
-    asyncio.run(monitor())
+    try:
+        asyncio.run(monitor())
+    finally:
+        if imu is not None:
+            imu.stop()
+        if recorder is not None:
+            recorder.close()
+            print(recorder.format_summary())
+    return 0
+
+
+def _format_imu(imu, h) -> str:
+    rate = f"{h.rate_hz:6.1f} Hz" if h.rate_hz else "     — Hz"
+    t = h.transport
+    counters = "  ".join(
+        f"{k} {t[k]}" for k in ("packets", "dropped", "invalid", "out_of_order", "parse_errors")
+        if k in t
+    )
+    line = f"{'imu':10} {h.state:12} {rate}  samples {h.samples}  {counters}"
+    s = imu.last_sample
+    if s is not None:
+        a, g = s.accel, s.gyro
+        line += (
+            f"\n{'':10} accel m/s² {a[0]:+6.2f} {a[1]:+6.2f} {a[2]:+6.2f}"
+            f"   gyro rad/s {g[0]:+6.3f} {g[1]:+6.3f} {g[2]:+6.3f}"
+        )
+        if s.temperature_c is not None:
+            line += f"   {s.temperature_c:.1f} °C"
+    if h.units_warning:
+        line += f"\n{'':10} ⚠ {h.units_warning}"
+    if h.last_error and h.state != "streaming":
+        line += f"\n{'':10} ⚠ {h.last_error}"
+    return line
+
+
+def cmd_fake_esp32(args: argparse.Namespace) -> int:
+    """Emulate the ESP32-CAM glasses on this Mac (no hardware): two MJPEG eyes + UDP IMU."""
+    from opengaze.debug.fake_esp32 import Faults, start_fake_glasses
+
+    configure_logging(args.log_level or "INFO")
+    faults = Faults(
+        drop_rate=args.drop_rate,
+        jitter_ms=args.jitter_ms,
+        stall_every_s=args.stall_every,
+        disconnect_every_s=args.disconnect_every,
+        invalid_rate=args.invalid_rate,
+    )
+    glasses = start_fake_glasses(
+        host=args.host,
+        left_port=args.left_port,
+        right_port=args.right_port,
+        imu_port=args.imu_port,
+        resolution=tuple(args.resolution),
+        fps=args.fps,
+        imu_rate_hz=args.imu_rate,
+        faults=faults,
+    )
+    h = args.host
+    print("EMULATED OpenGaze glasses (not real hardware):")
+    print(f"  left  eye  http://{h}:{glasses.left.port}/stream   status /status")
+    print(f"  right eye  http://{h}:{glasses.right.port}/stream   status /status")
+    print(f"  right IMU  UDP subscribe to {h}:{glasses.imu.port}")
+    print("Try:  opengaze diagnostics --profile configs/hardware/esp32-emulator.yaml")
+    print("Ctrl+C to stop.")
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        glasses.stop()
     return 0
 
 
@@ -342,7 +443,7 @@ def cmd_desktop(args: argparse.Namespace) -> int:
         cartesia=CartesiaConfig.from_env(),
     )
     print(voice.status)
-    print("Gaze cursor is ON across all apps. Long blink = click.\n"
+    print("Gaze cursor is ON across all apps. Double blink = left click.\n"
           "⌃⌥G pause/resume gaze · ⌃⌥D dictate · ⌃⌥S read selection · "
           "moving the mouse takes over for 2 s · Ctrl+C here to quit.")
     return run_desktop_mode(report, config, voice)
@@ -536,6 +637,24 @@ def build_parser() -> argparse.ArgumentParser:
             default=[],
             help="per-user overlay YAML merged over the profile (repeatable)",
         )
+        p.add_argument(
+            "--set",
+            action="append",
+            default=[],
+            metavar="KEY=VALUE",
+            help="override one profile setting, e.g. "
+            "cameras.left_eye.options.host=192.168.1.42 (repeatable)",
+        )
+
+    def add_metrics_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--metrics",
+            nargs="?",
+            const="auto",
+            metavar="PATH",
+            help="log input health as JSONL (default path: logs/metrics/hardware-<time>.jsonl)",
+        )
+        p.add_argument("--metrics-interval", type=float, default=1.0, help="seconds per row")
 
     p = sub.add_parser("run", help="open gaze test environment (auto-calibrates if needed)")
     add_profile_args(p)
@@ -576,12 +695,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true", help="print every move")
     p.set_defaults(func=cmd_cursor_test)
 
-    p = sub.add_parser("diagnostics", help="live camera previews and health (PySide6)")
+    p = sub.add_parser("diagnostics", help="live camera + IMU previews and health (PySide6)")
     add_profile_args(p)
+    add_metrics_args(p)
     p.set_defaults(func=cmd_diagnostics)
 
-    p = sub.add_parser("headless", help="run capture without UI, print health")
+    p = sub.add_parser("headless", help="run capture without UI, print camera + IMU health")
     add_profile_args(p)
+    add_metrics_args(p)
     p.add_argument("--seconds", type=float, default=5.0)
     p.add_argument("--interval", type=float, default=1.0)
     p.set_defaults(func=cmd_headless)
@@ -589,7 +710,26 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("validate", help="validate a hardware profile")
     p.add_argument("profile_path")
     p.add_argument("--overlay", action="append", default=[])
+    p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser(
+        "fake-esp32", help="emulate the ESP32-CAM glasses locally (MJPEG eyes + UDP IMU)"
+    )
+    p.add_argument("--host", default="127.0.0.1", help="bind address (0.0.0.0 = whole LAN)")
+    p.add_argument("--left-port", type=int, default=8081)
+    p.add_argument("--right-port", type=int, default=8082)
+    p.add_argument("--imu-port", type=int, default=5006, help="UDP port for subscribe requests")
+    p.add_argument("--resolution", type=int, nargs=2, default=[320, 240], metavar=("W", "H"))
+    p.add_argument("--fps", type=float, default=20.0)
+    p.add_argument("--imu-rate", type=float, default=100.0, help="IMU readings per second")
+    p.add_argument("--drop-rate", type=float, default=0.0, help="fraction of frames/packets lost")
+    p.add_argument("--jitter-ms", type=float, default=0.0, help="random extra delay per frame")
+    p.add_argument("--stall-every", type=float, help="pause streaming 2 s this often (s)")
+    p.add_argument("--disconnect-every", type=float, help="drop the stream connection (s)")
+    p.add_argument("--invalid-rate", type=float, default=0.0,
+                   help="fraction of IMU readings sent as valid: false")
+    p.set_defaults(func=cmd_fake_esp32)
 
     p = sub.add_parser("probe-cameras", help="list OpenCV camera indices that deliver frames")
     p.add_argument("--max-index", type=int, default=5)

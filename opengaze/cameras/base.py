@@ -65,6 +65,9 @@ class CameraSource(ABC):
     # Option names that cannot change how eye features map to the screen (timing, fault
     # injection). Everything else in ``options`` is part of the calibration fingerprint.
     non_geometric_options: ClassVar[frozenset[str]] = frozenset()
+    # True for adapters that open cameras through AVFoundation, which needs macOS camera
+    # permission. Network streams don't.
+    needs_camera_permission: ClassVar[bool] = False
 
     def __init__(self, config: CameraConfig) -> None:
         self.config = config
@@ -239,6 +242,7 @@ class RawCapture:
     timestamp_uncertainty_ns: int | None = None
     status: FrameStatus = FrameStatus.OK
     warnings: tuple[str, ...] = ()
+    sequence: int | None = None  # the device's own frame counter, when it sends one
 
 
 class _BlockingWorker:
@@ -389,6 +393,7 @@ class BlockingCaptureSource(CameraSource):
             "timestamp_uncertainty_ns": raw.timestamp_uncertainty_ns,
             "status": raw.status,
             "warnings": raw.warnings,
+            "sequence": raw.sequence,
         }
         fields.update(overrides)
         return self._make_frame(raw.image, **fields)

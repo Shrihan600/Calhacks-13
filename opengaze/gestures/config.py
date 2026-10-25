@@ -121,7 +121,7 @@ class GestureSettings(_Model):
     glance: GlanceSettings = GlanceSettings()
     # Unbound gestures are still detected (and shown in the UI) but do nothing.
     bindings: dict[Gesture, Binding] = Field(
-        default_factory=lambda: {Gesture.LONG_BLINK: Binding(mouse="click")}
+        default_factory=lambda: {Gesture.DOUBLE_BLINK: Binding(mouse="click")}
     )
 
     @field_validator("bindings")

@@ -283,21 +283,51 @@ def _gaze_issues(profile: HardwareProfile, mode: TrackingMode | None) -> list[Va
     return issues
 
 
-def check_hardware_profile(path: Path, overlays: Iterable[Path] = ()) -> ProfileReport:
-    """Read a profile (plus optional per-user overlay files) and report every problem."""
+def parse_overrides(assignments: Iterable[str]) -> dict[str, Any]:
+    """``["cameras.left_eye.options.host=192.168.1.42", "imu.options.port=5005"]`` → a nested
+    mapping to merge over a profile. Values are parsed as YAML (numbers, booleans, lists).
+    The leading ``hardware_profile.`` is optional."""
+    result: dict[str, Any] = {}
+    for assignment in assignments:
+        key, sep, raw = assignment.partition("=")
+        key = key.strip().removeprefix("hardware_profile.")
+        if not sep or not key or any(not part for part in key.split(".")):
+            raise ValueError(f"--set expects dotted.key=value, got {assignment!r}")
+        try:
+            value = yaml.safe_load(raw) if raw.strip() else ""
+        except yaml.YAMLError as exc:
+            raise ValueError(f"--set {key}: can't parse value {raw!r}: {exc}") from None
+        node = result
+        *parents, leaf = key.split(".")
+        for part in parents:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                raise ValueError(f"--set {key}: conflicts with another --set")
+        node[leaf] = value
+    return {"hardware_profile": result}
+
+
+def check_hardware_profile(
+    path: Path, overlays: Iterable[Path] = (), overrides: Iterable[str] = ()
+) -> ProfileReport:
+    """Read a profile (plus optional per-user overlay files and ``--set`` overrides) and
+    report every problem."""
     path = Path(path)
     try:
         data = read_yaml(path)
         for overlay in overlays:
             data = deep_merge(data, read_yaml(Path(overlay)))
+        data = deep_merge(data, parse_overrides(overrides))
     except (OSError, yaml.YAMLError, ValueError) as exc:
         return ProfileReport(path, None, (ValidationIssue("error", str(path), str(exc)),))
     return check_profile_data(data, path=path, base_dir=path.resolve().parent)
 
 
-def load_hardware_profile(path: Path, overlays: Iterable[Path] = ()) -> ProfileReport:
+def load_hardware_profile(
+    path: Path, overlays: Iterable[Path] = (), overrides: Iterable[str] = ()
+) -> ProfileReport:
     """Like ``check_hardware_profile`` but raises ``ProfileValidationError`` on any error."""
-    report = check_hardware_profile(path, overlays)
+    report = check_hardware_profile(path, overlays, overrides)
     if not report.ok:
         raise ProfileValidationError(report.path, report.issues)
     for issue in report.warnings:

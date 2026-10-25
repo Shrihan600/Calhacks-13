@@ -1,0 +1,91 @@
+# OpenGaze glasses: two Wi-Fi ESP32-CAM eye cameras + MPU-6050 on the RIGHT ESP32,
+# plus the MacBook webcam for head position/orientation (Mode C).
+# Interface contract: docs/hardware-interface.md. Firmware: firmware/opengaze_esp32cam/.
+#
+# Addresses: the reference firmware announces opengaze-left.local / opengaze-right.local
+# over mDNS. If the network blocks mDNS, use IPs without editing this file:
+#   opengaze diagnostics --profile configs/hardware/esp32-glasses.yaml \
+#     --set cameras.left_eye.options.host=192.168.1.41 \
+#     --set cameras.right_eye.options.host=192.168.1.42 \
+#     --set imu.options.device_host=192.168.1.42
+# or put those keys in an --overlay file. Changing an address never invalidates calibration.
+#
+# Bench first: the boards' documentation specifies 20 cm antenna separation, so test live
+# Wi-Fi on a bench, not on someone's head (docs/hardware-interface.md §Safety).
+hardware_profile:
+  id: esp32-glasses
+  version: 1
+  frame_design: opengaze-3dprint-v1   # bump `version` when the mounts or frame change
+
+  cameras:
+    left_eye:
+      source_type: esp32
+      resolution: [320, 240]   # must match the firmware's FRAME_SIZE (read back and reported)
+      fps: 20                  # target only; the firmware sets the real rate
+      rotation_degrees: 0      # right angles only; undo how the module is mounted
+      mirror_horizontal: false
+      mounting_position: temporal_side
+      connect_timeout_s: 5.0
+      read_timeout_s: 3.0      # Wi-Fi hiccups: reconnect after 3 s without a frame
+      options:
+        host: opengaze-left.local
+        port: 81
+        path: /stream
+        status_port: 80        # /status JSON; null to skip
+        apply_settings: false  # true: push resolution/jpeg_quality to /control on connect
+        jpeg_quality: null     # 4-63, lower = better; null = firmware default
+
+    right_eye:
+      source_type: esp32
+      resolution: [320, 240]
+      fps: 20
+      rotation_degrees: 0
+      mirror_horizontal: false
+      mounting_position: temporal_side
+      connect_timeout_s: 5.0
+      read_timeout_s: 3.0
+      options:
+        host: opengaze-right.local
+        port: 81
+        path: /stream
+        status_port: 80
+
+    head:
+      source_type: mac_webcam
+      device_id: auto
+      resolution: [1280, 720]
+      fps: 30
+      mounting_position: display_top
+
+  # MPU-6050 on the RIGHT ESP32 (I²C), streamed as JSON over UDP.
+  imu:
+    source_type: udp
+    enabled: true
+    options:
+      bind_host: 0.0.0.0
+      port: 5005               # the Mac listens here
+      format: json
+      gyro_units: rad_s        # the reference firmware sends rad/s and m/s²;
+      accel_units: m_s2        # diagnostics warn if the readings don't fit these units
+      expected_device_id: right_esp32
+      # Subscribe handshake: the Mac tells the ESP32 where to send, so the Mac's IP is never
+      # compiled into the firmware.
+      device_host: opengaze-right.local
+      device_port: 5006
+    # Which IMU axis points to the head's right, the chin, and forward. UNVERIFIED until the
+    # board is mounted: in diagnostics, nod (pitch) and shake (yaw) and see which gyro axis
+    # responds, then fix the signs. Must be a proper rotation.
+    axes: ["+x", "+y", "+z"]
+    webcam_yaw_rate: 0.5
+    stale_timeout_s: 0.5
+
+  gaze:
+    pipeline: pupil_2d
+    detector_2d:
+      type: ellipse_fit
+      options: {}
+    closed_below_confidence: 0.3
+
+  calibration:
+    screen_mapping: per_user
+    geometry_estimation: data_driven

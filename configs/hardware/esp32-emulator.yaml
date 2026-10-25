@@ -1,0 +1,60 @@
+# The ESP32 glasses profile pointed at `opengaze fake-esp32` on this Mac.
+# Same adapters, protocol and code path as configs/hardware/esp32-glasses.yaml; only the
+# addresses differ. Everything the emulator serves is labelled EMULATED in diagnostics.
+#
+#   terminal 1:  opengaze fake-esp32 --drop-rate 0.05 --jitter-ms 30
+#   terminal 2:  opengaze diagnostics --profile configs/hardware/esp32-emulator.yaml
+#
+# No webcam handy (or no camera permission)? Add --set cameras.head.enabled=false
+hardware_profile:
+  id: esp32-emulator
+  version: 1
+  frame_design: emulated
+
+  cameras:
+    left_eye:
+      source_type: esp32
+      resolution: [320, 240]
+      fps: 20
+      mounting_position: temporal_side
+      connect_timeout_s: 5.0
+      read_timeout_s: 3.0
+      options: {host: 127.0.0.1, port: 8081, status_port: 8081}
+
+    right_eye:
+      source_type: esp32
+      resolution: [320, 240]
+      fps: 20
+      mirror_horizontal: true  # the emulator renders the right eye mirror-image
+      mounting_position: temporal_side
+      connect_timeout_s: 5.0
+      read_timeout_s: 3.0
+      options: {host: 127.0.0.1, port: 8082, status_port: 8082}
+
+    head:
+      source_type: mac_webcam
+      device_id: auto
+      resolution: [1280, 720]
+      fps: 30
+      mounting_position: display_top
+
+  imu:
+    source_type: udp
+    options:
+      bind_host: 127.0.0.1
+      port: 5005
+      format: json
+      gyro_units: rad_s
+      accel_units: m_s2
+      expected_device_id: right_esp32
+      device_host: 127.0.0.1
+      device_port: 5006
+    axes: ["+x", "+y", "+z"]
+
+  gaze:
+    pipeline: pupil_2d
+    detector_2d: {type: ellipse_fit}
+
+  calibration:
+    screen_mapping: per_user
+    geometry_estimation: data_driven

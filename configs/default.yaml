@@ -53,8 +53,7 @@ gestures:
     hold_ms: 900
     hold_repeat_ms: 350      # holds repeat while held (null = fire once)
   bindings:
-    long_blink: {mouse: click}
-    double_blink: {mouse: click}          # left click
+    double_blink: {mouse: click}          # left click (no dwell or long-blink click)
     triple_blink: {app: toggle_cursor}
     # Left eye = left button held: wink and hold to press, look to drag, reopen to release.
     hold_wink_left: {mouse: hold}

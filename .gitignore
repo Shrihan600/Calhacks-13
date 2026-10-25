@@ -30,3 +30,6 @@ dashboard/dist/
 .idea/
 .vscode/
 demo/*.csv
+
+# ESP32 firmware Wi-Fi credentials
+firmware/**/secrets.h

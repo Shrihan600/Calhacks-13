@@ -82,7 +82,7 @@ def test_custom_key_needs_explicit_role() -> None:
         ({"source_type": "synthetic", "optics": {"distortion": [0.1, 0.2, 0.3]}}, "coefficients"),
         ({"source_type": "synthetic", "options": {"pattern": "spiral"}}, "options.pattern"),
         ({"source_type": "webcam9000"}, "unknown source_type"),
-        ({"source_type": "esp32"}, "Phase 5"),
+        ({"source_type": "esp32"}, "set host"),
         ({"source_type": "raspberry_pi"}, "not implemented yet"),
     ],
 )

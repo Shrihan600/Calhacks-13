@@ -2,7 +2,7 @@
 
 Eye-gaze cursor control and communication tool for macOS, built for people with limited hand or arm mobility. CalHacks 13.0 prototype — **not a medically validated assistive device**.
 
-You look at the screen. The software tracks where your eyes are pointing and moves the mouse cursor there. You hold a long blink (400 ms) to click. No hands required.
+You look at the screen. The software tracks where your eyes are pointing and moves the mouse cursor there. You blink twice quickly to left-click. No hands required.
 
 ---
 
@@ -13,7 +13,7 @@ You look at the screen. The software tracks where your eyes are pointing and mov
 | Webcam-only gaze tracking (Mode A) | **Working** |
 | 9-point gaze calibration wizard | **Working** |
 | Fullscreen gaze test environment | **Working** |
-| Long-blink click (hold blink 400 ms) | **Working** |
+| Double-blink left click | **Working** |
 | Real mouse cursor control | **Working** |
 | On-screen gaze keyboard | **Working** |
 | Voice dictation — Cartesia Ink-Whisper STT | **Working** (opt-in, needs API key) |
@@ -78,12 +78,14 @@ Before the gaze model can work, it must be calibrated to your face, eyes, and li
 
 ### Blink click
 
-- **Natural blinks** (< 180 ms) are completely ignored
-- **Long blink** (both eyes closed ≥ 400 ms) fires a click
-- When eyes start closing, the gaze position **freezes** — the click fires at the last stable pre-blink position, not a noisy mid-blink estimate
+- **Double blink** (two short blinks, 40–300 ms each, within 450 ms of each other) fires a
+  left click. It fires once the 450 ms gap after the second blink expires, so a triple blink
+  (toggle cursor control) is never mistaken for it.
+- A **single blink** does nothing. There is no long-blink click and no dwell click.
+- While the eyes are closed the gaze position **freezes**, so the click lands at the last
+  stable pre-blink position, not a noisy mid-blink estimate
 - After a click there is an 800 ms cooldown to prevent double-fires
-- A yellow arc fills around the gaze dot to show blink progress
-- A **double blink** also clicks. Winks act as the mouse buttons: see
+- Winks act as the other mouse buttons: see
   [Eye gestures and keybinds](#eye-gestures-and-keybinds)
 
 ### Safety systems
@@ -207,7 +209,7 @@ Without both a key and the opt-in, nothing is sent anywhere: `SPEAK` uses macOS 
 .venv/bin/opengaze desktop --cloud
 ```
 
-No fullscreen window: the real macOS cursor follows your gaze in every app, and your eye gestures fire their `gestures:` bindings there. These are the same ones as in `opengaze run`: by default a **long blink clicks** where you were looking, and a held wink drags. A yellow ring fills around the cursor as you hold a blink or wink, so you can see it coming. The voice bar below floats on top, so you can blink-click 🎤 to dictate into the app you're using.
+No fullscreen window: the real macOS cursor follows your gaze in every app, and your eye gestures fire their `gestures:` bindings there. These are the same ones as in `opengaze run`: by default a **double blink left-clicks** where you were looking, and a held wink drags. A yellow ring fills around the cursor as you hold a wink, so you can see the drag coming. The voice bar below floats on top, so you can blink-click 🎤 to dictate into the app you're using.
 
 | Control | How |
 |---|---|
@@ -289,11 +291,17 @@ Prints whether a calibration exists for your current hardware profile and whethe
 
 ### Diagnostics
 
-Live camera previews and health monitoring (useful to verify cameras are working before calibrating):
+Live camera previews, IMU readings and health monitoring (useful to verify hardware is working before calibrating):
 
 ```bash
 .venv/bin/opengaze diagnostics
+.venv/bin/opengaze diagnostics --profile configs/hardware/esp32-glasses.yaml --metrics
 ```
+
+A badge per input (each camera, the IMU) shows OK / WARN / DOWN. Each camera tile shows fps,
+jitter, frame age, delay, skipped (sequence gaps), partial and reconnect counts. The IMU tile
+shows live accelerometer (m/s²) and gyro (rad/s) values with rolling plots, the rate, drops
+and a units check. `--metrics` logs all of it (numbers only) to `logs/metrics/*.jsonl`.
 
 ### Other commands
 
@@ -304,8 +312,15 @@ Live camera previews and health monitoring (useful to verify cameras are working
 # Validate a hardware profile YAML
 .venv/bin/opengaze validate configs/hardware/webcam-only.yaml
 
-# Run capture headlessly and print health tables (SSH/CI)
+# Run capture headlessly and print camera + IMU health tables (SSH/CI)
 .venv/bin/opengaze headless --seconds 10
+
+# Emulate the ESP32-CAM glasses on this Mac (two MJPEG eyes + UDP IMU, faults optional)
+.venv/bin/opengaze fake-esp32 --drop-rate 0.05 --jitter-ms 30
+
+# Override any profile setting for one run (IPs, ports, enable/disable a camera)
+.venv/bin/opengaze diagnostics --profile configs/hardware/esp32-glasses.yaml \
+  --set cameras.left_eye.options.host=192.168.1.41
 
 # Check Cartesia voice (TTS + dictation) without a camera
 .venv/bin/opengaze voice-test --cloud
@@ -426,6 +441,30 @@ With the 3D eye pipeline, the calibration intro screen waits until the eye model
 It fits from varied eye movement, so look around the screen first. Starting early would have
 you staring at one dot that the unfitted model can never use.
 
+## ESP32-CAM glasses (Wi-Fi)
+
+The confirmed hardware: two Inland ESP32-CAM boards (left and right eye) stream MJPEG over
+2.4 GHz Wi-Fi. An MPU-6050 on the **right** board sends JSON telemetry over UDP. The MacBook
+webcam provides head position and orientation, and USB-C carries power only. The full
+contract (endpoints, headers, units, clock sync, failure handling) is in
+[`docs/hardware-interface.md`](docs/hardware-interface.md). Reference firmware, **not yet
+compiled or flashed**, is in [`firmware/`](firmware/).
+
+```bash
+# No hardware: run the emulator and point the ESP32 profile at it
+.venv/bin/opengaze fake-esp32                                             # terminal 1
+.venv/bin/opengaze diagnostics --profile configs/hardware/esp32-emulator.yaml   # terminal 2
+
+# Real boards (mDNS names from the firmware; use --set …host=<ip> if mDNS is blocked)
+.venv/bin/opengaze headless --profile configs/hardware/esp32-glasses.yaml --seconds 30 --metrics
+.venv/bin/opengaze diagnostics --profile configs/hardware/esp32-glasses.yaml
+```
+
+The ESP32 profile is Mode C. Once both streams and the IMU are up, `opengaze calibrate` and
+`opengaze run` use them like any other eye cameras. Bench-test live Wi-Fi at the boards'
+documented 20 cm antenna separation, not on someone's head, until the RF-exposure review is
+done.
+
 ## Eye cameras (Modes B/C)
 
 Each eye camera runs through one of two pipelines, picked by `gaze.pipeline` in the hardware
@@ -479,8 +518,10 @@ tilting right and moving right should all read positive.
 Add an `imu:` section to the hardware profile (see `configs/hardware/generic-usb.yaml`):
 `source_type: serial` (USB, needs `pip install -e '.[imu]'`) or `udp` (ESP32 / Pi over
 Wi-Fi), the device's units, and `axes`: which IMU axis points to the head's right, the chin,
-and forward. The device sends one reading per line, gyro then accelerometer, optionally led
-by a timestamp in µs:
+and forward. Over UDP the device can send JSON telemetry with sequence numbers and device
+timestamps (the ESP32 glasses do; see [`docs/hardware-interface.md`](docs/hardware-interface.md)),
+or the simple text protocol below. The text protocol sends one reading per line, gyro then
+accelerometer, optionally led by a timestamp in µs:
 
 ```
 gx,gy,gz,ax,ay,az
@@ -555,6 +596,8 @@ configs/
   default.yaml                    app config (log level, default profile path)
   hardware/
     webcam-only.yaml              Mode A — built-in MacBook webcam
+    esp32-glasses.yaml            Mode C — two Wi-Fi ESP32-CAM eyes + MPU-6050 (right) + webcam
+    esp32-emulator.yaml           the same, pointed at `opengaze fake-esp32` on localhost
     generic-usb.yaml              template for external USB cameras
     synthetic-dual-eye.yaml       simulated two-eye rig (no hardware needed)
     synthetic-faults.yaml         simulated rig with injected faults
@@ -567,6 +610,9 @@ opengaze/
     manager.py                    CameraManager: reconnect loop, latest-frame slots
     runtime.py                    CaptureRuntime: background thread
     opencv_source.py              mac_webcam and usb adapters
+    esp32.py                      esp32 adapter: ESP32-CAM MJPEG over Wi-Fi
+    mjpeg.py                      MJPEG-over-HTTP stream reader (stdlib, no FFmpeg)
+    timing.py                     RateMeter, DeviceClockSync (device → host clock)
     simulated.py                  synthetic + recorded adapters
     permissions.py                macOS camera permission request
     registry.py                   source_type → class lookup
@@ -586,14 +632,15 @@ opengaze/
     storage.py                    CalibrationStore: save/load .npz by fingerprint
     mappers.py                    poly-ridge and geometric screen mappers (Modes B/C)
     adaptive.py                   adaptive calibration session, logs, points-needed replay
-  imu/                            IMU sources (serial/UDP/synthetic), fusion, head pose
+  imu/                            IMU sources (serial/UDP text or JSON/synthetic), fusion,
+                                  head pose
   gaze/                           eye pipelines (2D pupil / 3D eye model), GazeTracker, GazeLoop
   gestures/                       blink/wink/glance detectors, recognizer, keybind dispatch
   debug/                          traces, stage reports, simulated user, record/replay,
-                                  cursor self-test
+                                  cursor self-test, fake_esp32 emulator, metrics recorder
   control/
     filter.py                     OneEuroFilter: adaptive smoothing
-    dwell.py                      DwellDetector: hold gaze → click (unused in main UI)
+    dwell.py                      DwellDetector: hold gaze → click (not used; clicks are blinks)
     safety.py                     ConfidenceGate, JumpDetector, EmergencyStop, UserOverride
     cursor.py                     QuartzCursorDriver: macOS CGEvent move + click
     keystrokes.py                 Type Unicode into the focused app, copy selection
@@ -607,7 +654,7 @@ opengaze/
     desktop_mode.py               System-wide gaze cursor: click-through overlay + voice bar
     dictation_ui.py               Floating voice bar: dictate into any app, read selection aloud
     macwin.py                     Floating, non-activating, all-Spaces window helpers
-    diagnostics.py                Live camera health + preview window
+    diagnostics.py                Live camera + IMU health, previews, input badges
   voice/
     cartesia.py                   Cartesia REST client: Ink-Whisper STT, Sonic TTS
     audio.py                      MicRecorder: capture + automatic end-of-speech
@@ -623,12 +670,19 @@ tests/
   test_calibration.py             GazeModel, CalibrationSession, ValidationReport, store
   test_control.py                 OneEuroFilter, DwellDetector, safety, GazeDriver
   test_voice.py                   Cartesia client (mocked HTTP), end-of-speech, VoiceService
+  test_esp32.py                   clock sync, MJPEG, esp32 adapter vs emulator, reconnects
+  test_imu_telemetry.py           MPU-6050 JSON over UDP, handshake, units, metrics
 
 scripts/
   make_synthetic_recording.py     render a synthetic eye video for replay testing
+firmware/
+  opengaze_esp32cam/              reference ESP32-CAM sketch (left/right; untested)
 docs/
   architecture.md
+  hardware-interface.md           ESP32 glasses ↔ Mac contract (endpoints, units, sync)
   privacy.md
+PROJECT_STATUS.md                 what is verified vs. not, open tasks
+AI_HANDOFF.md                     continuation notes for the next developer / AI session
 ```
 
 ---

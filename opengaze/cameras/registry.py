@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from opengaze.cameras.base import CameraSource
+from opengaze.cameras.esp32 import ESP32StreamSource
 from opengaze.cameras.mac_webcam import MacWebcamSource
 from opengaze.cameras.recorded import RecordedVideoSource
 from opengaze.cameras.simulated import SyntheticCameraSource
@@ -12,14 +13,19 @@ from opengaze.config.schema import CameraConfig
 
 _SOURCES: dict[str, type[CameraSource]] = {
     cls.source_type: cls
-    for cls in (MacWebcamSource, USBCameraSource, RecordedVideoSource, SyntheticCameraSource)
+    for cls in (
+        MacWebcamSource,
+        USBCameraSource,
+        RecordedVideoSource,
+        SyntheticCameraSource,
+        ESP32StreamSource,
+    )
 }
 
 # Accepted in profiles so they can be written ahead of time, but rejected by the validator
 # with this explanation until an adapter exists. Nothing pretends to support them yet.
 PLANNED_SOURCE_TYPES: dict[str, str] = {
     "raspberry_pi": "planned for Phase 5 (MJPEG-over-HTTP / RTSP network stream)",
-    "esp32": "planned for Phase 5 (MJPEG-over-HTTP network stream)",
 }
 
 

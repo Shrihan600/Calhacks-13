@@ -33,7 +33,7 @@ all unfinalized. None of them may leak past the camera layer and the hardware pr
         ▼
  ┌───────────────────────── main thread (PySide6) ──────────────────────────────┐
  │ diagnostics · calibration wizard · gaze overlay · communication board         │
- │ control/: Quartz cursor, dwell click state machine, safety (pause / e-stop)   │
+ │ control/: Quartz cursor, blink-gesture clicks, safety (pause / e-stop)       │
  └──────┬───────────────────────────────────────────────────────────────────────┘
         │  state snapshots (no images by default)
         ▼
@@ -82,7 +82,7 @@ Pi, or a Pi for USB, only edits YAML.
 | `recorded` | `RecordedVideoSource` | Phase 1. Video files, paced in real time or as fast as possible, optional loop. |
 | `synthetic` | `SyntheticCameraSource` | Phase 1. Rendered eyes with ground truth, plus fault injection (drops, latency, jitter, corrupt frames, disconnects, failed connects). |
 | `raspberry_pi` | `RaspberryPiStreamSource` | Phase 5. MJPEG over HTTP first, RTSP via FFmpeg as an option. |
-| `esp32` | `ESP32StreamSource` | Phase 5. MJPEG over HTTP (the transport ESP32 camera web-server examples commonly use). |
+| `esp32` | `ESP32StreamSource` | Implemented (tested against the emulator only). MJPEG over HTTP with device sequence numbers and timestamps; see [`hardware-interface.md`](hardware-interface.md). |
 
 The validator rejects a planned source type and names the phase. It never pretends to work.
 
@@ -246,8 +246,8 @@ demo/               demo assets (generated recordings are git-ignored)
 4. **Safety and control polish**: One Euro filter, confidence freeze, jump detection, pause/e-stop,
    Accessibility permission wizard.
 5. **External eye cameras (Modes B/C)**: classical pupil detector, 3D eye model, single/dual
-   fusion, head-compensated screen mapping, eye-gesture keybinds (done); ROI editor, Pi and
-   ESP32 stream adapters (planned). Hardware arrival gates this phase; the synthetic source keeps it
+   fusion, head-compensated screen mapping, eye-gesture keybinds, ESP32-CAM Wi-Fi adapter and
+   MPU-6050 UDP telemetry with an emulator (done); ROI editor, Pi stream adapter (planned). Hardware arrival gates this phase; the synthetic source keeps it
    testable before then.
 6. **Communication + sponsors**: AAC board, Claude text help, Cartesia speech, optional Convex.
 7. **Demo polish**: latency/accuracy measurement, scripted 2-minute judge flow, docs.
@@ -275,8 +275,12 @@ demo/               demo assets (generated recordings are git-ignored)
 6. **Two USB cameras on a MacBook Air.** The Air has only two ports, so a hub is likely. USB bandwidth
    and power with two UVC streams on one hub are unverified; use MJPEG and low resolutions (eye crops
    need little).
-7. **Wireless streams.** Wi-Fi JPEG streams (ESP32 especially) have low and jittery frame rates and
-   unknown capture timestamps. A crowded hackathon network makes this worse. Prefer wired for the demo.
+7. **Wireless streams.** Wi-Fi JPEG streams (ESP32 especially) have low and jittery frame rates. A
+   crowded hackathon network makes this worse. The chosen hardware is Wi-Fi only, so the
+   ESP32 firmware sends device timestamps and sequence numbers, the Mac maps them with a
+   min-offset clock sync, and diagnostics measure drops, stalls and delay
+   ([`hardware-interface.md`](hardware-interface.md)). Consider a dedicated travel router for
+   the demo.
 8. **Permissions.** Camera and Accessibility permissions attach to the launching app (Terminal, IDE).
    The demo must launch from one already-authorized host. Confirmed while building Phase 1: OpenCV
    can't show the camera prompt from a worker thread. So `opengaze` requests camera access on the

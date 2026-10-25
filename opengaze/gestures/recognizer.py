@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from opengaze.gestures.config import GestureSettings
 from opengaze.gestures.detectors import BlinkPatternDetector, GlanceDetector, WinkDetector
-from opengaze.gestures.types import EyeSignal, GestureEvent
+from opengaze.gestures.types import EyeSignal, Gesture, GestureEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +57,12 @@ class GestureRecognizer:
         return GestureFrame(
             events=tuple(events),
             any_closed=any_closed,
-            blink_progress=self.blink.progress(sig.t),
+            # The fill ring only promises something when a long blink does something.
+            blink_progress=(
+                self.blink.progress(sig.t)
+                if Gesture.LONG_BLINK in self.settings.bindings
+                else 0.0
+            ),
             wink_progress=self.wink.progress(sig.t),
             hold_progress=self.glance.progress(sig.t),
             glance_zone=self.glance.zone,

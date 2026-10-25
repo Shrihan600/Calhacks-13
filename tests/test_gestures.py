@@ -317,5 +317,6 @@ class TestConfig:
 
     def test_default_config_bindings_load(self):
         config = load_app_config(REPO_ROOT / "configs" / "default.yaml")
-        assert config.gestures.bindings[Gesture.LONG_BLINK] == Binding(mouse="click")
+        assert config.gestures.bindings[Gesture.DOUBLE_BLINK] == Binding(mouse="click")
+        assert Gesture.LONG_BLINK not in config.gestures.bindings  # no long-blink click
         assert len(config.gestures.bindings) > 5

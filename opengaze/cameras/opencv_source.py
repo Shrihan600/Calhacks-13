@@ -114,6 +114,7 @@ def resolution_result(requested: tuple[int, int] | None, actual: tuple[int, int]
 
 class OpenCVCaptureSource(BlockingCaptureSource):
     source_kind = SourceKind.LIVE
+    needs_camera_permission = True
 
     @abstractmethod
     def _device_index(self) -> int | str:

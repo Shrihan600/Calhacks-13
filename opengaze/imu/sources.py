@@ -7,11 +7,14 @@ own thread. Each validates its ``options`` with its own pydantic model, like cam
 |---|---|
 | ``synthetic`` | simulated head motion with ground truth, gyro noise and bias (no hardware) |
 | ``serial``    | USB serial (Arduino / ESP32 / Pi Pico over USB), needs ``pyserial`` |
-| ``udp``       | UDP datagrams (ESP32 / Pi over Wi-Fi), stdlib only |
+| ``udp``       | UDP datagrams (ESP32 / Pi over Wi-Fi): text lines or JSON telemetry, stdlib only |
 """
 
 from __future__ import annotations
 
+import collections
+import dataclasses
+import json
 import math
 import socket
 import time
@@ -21,7 +24,16 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
-from opengaze.imu.types import GRAVITY, AccelUnits, GyroUnits, ImuSample, parse_line
+from opengaze.cameras.timing import DeviceClockSync
+from opengaze.imu.types import (
+    GRAVITY,
+    AccelUnits,
+    GyroUnits,
+    ImuSample,
+    iter_json_objects,
+    parse_json_record,
+    parse_line,
+)
 from opengaze.vision.head_pose import rotation_from_angles
 
 if TYPE_CHECKING:
@@ -51,6 +63,10 @@ class ImuSource(ABC):
     @abstractmethod
     def close(self) -> None:
         """Release the device. Idempotent."""
+
+    def stats(self) -> dict[str, Any]:
+        """Transport counters for diagnostics (drops, bad packets, …). Empty if none."""
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -204,13 +220,29 @@ class SerialImuSource(ImuSource):
 # ---------------------------------------------------------------------------
 
 
-class UdpImuOptions(_LineOptions):
+class UdpImuOptions(_Options):
     bind_host: str = "0.0.0.0"
     port: int = Field(default=5005, ge=0, lt=65536)  # 0 = any free port
+    # text: protocol lines (``parse_line``); json: telemetry objects (``parse_json_record``);
+    # auto: decide per datagram (JSON starts with ``{`` or ``[``).
+    format: Literal["auto", "text", "json"] = "auto"
+    # null = the format's own default: text deg_s / g, json rad_s / m_s2.
+    gyro_units: GyroUnits | None = None
+    accel_units: AccelUnits | None = None
+    # Accept only telemetry with this device_id (others are counted and dropped).
+    expected_device_id: str | None = None
+    # Subscribe handshake: with device_host set, a small JSON datagram is sent to
+    # device_host:device_port every subscribe_interval_s, and the device streams to whoever
+    # subscribed. So the Mac's IP never has to be compiled into the firmware.
+    device_host: str | None = None
+    device_port: int = Field(default=5006, gt=0, lt=65536)
+    subscribe_interval_s: float = Field(default=1.0, gt=0.0)
+    # Map device timestamps to the host clock (min-offset sync). false = host receive time.
+    device_clock: bool = True
 
 
 class UdpImuSource(ImuSource):
-    """Each datagram holds one or more protocol lines."""
+    """Each datagram holds one or more readings (text lines, or JSON objects)."""
 
     source_type: ClassVar[str] = "udp"
     Options: ClassVar[type[BaseModel]] = UdpImuOptions
@@ -218,7 +250,14 @@ class UdpImuSource(ImuSource):
     def __init__(self, options: dict[str, Any] | None = None) -> None:
         super().__init__(options)
         self._sock: socket.socket | None = None
-        self._pending: list[ImuSample] = []
+        self._pending: collections.deque[ImuSample] = collections.deque()
+        self._clock = DeviceClockSync()
+        self._last_sequence: int | None = None
+        self._next_subscribe = 0.0
+        self._counters = collections.Counter[str]()
+        self.last_error: str | None = None
+        self.last_sender: tuple[str, int] | None = None
+        self.emulated = False
 
     @property
     def bound_port(self) -> int | None:
@@ -230,28 +269,141 @@ class UdpImuSource(ImuSource):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((o.bind_host, o.port))
         self._sock = sock
+        self._last_sequence = None
+        self._next_subscribe = 0.0
+
+    def _units(self, is_json: bool) -> tuple[GyroUnits, AccelUnits]:
+        o: UdpImuOptions = self.options
+        gyro = o.gyro_units or ("rad_s" if is_json else "deg_s")
+        accel = o.accel_units or ("m_s2" if is_json else "g")
+        return gyro, accel
+
+    def _subscribe(self) -> None:
+        o: UdpImuOptions = self.options
+        if o.device_host is None or self._sock is None:
+            return
+        now = time.monotonic()
+        if now < self._next_subscribe:
+            return
+        self._next_subscribe = now + o.subscribe_interval_s
+        message = json.dumps({"type": "subscribe", "port": self.bound_port}).encode()
+        try:
+            self._sock.sendto(message, (o.device_host, o.device_port))
+            self._counters["subscribes_sent"] += 1
+        except OSError as exc:  # unresolvable name, no route: keep listening anyway
+            from opengaze.cameras.mjpeg import describe_network_error
+
+            self._counters["subscribe_errors"] += 1
+            reason = describe_network_error(exc)
+            self.last_error = f"subscribe to {o.device_host}:{o.device_port} failed: {reason}"
 
     def read(self, timeout_s: float) -> ImuSample | None:
         assert self._sock is not None
-        if self._pending:
-            return self._pending.pop(0)
+        deadline = time.monotonic() + timeout_s
+        while not self._pending:
+            self._subscribe()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            o: UdpImuOptions = self.options
+            wait = remaining if o.device_host is None else min(remaining, o.subscribe_interval_s)
+            self._sock.settimeout(max(wait, 1e-3))
+            try:
+                data, sender = self._sock.recvfrom(65535)
+            except TimeoutError:
+                continue
+            self._handle_datagram(data, sender, time.monotonic_ns())
+        return self._pending.popleft()
+
+    def _handle_datagram(self, data: bytes, sender: tuple[str, int], now: int) -> None:
         o: UdpImuOptions = self.options
-        self._sock.settimeout(timeout_s)
+        self._counters["packets"] += 1
+        self.last_sender = sender
+        text = data.decode("utf-8", errors="replace")
+        stripped = text.lstrip()
+        is_json = o.format == "json" or (o.format == "auto" and stripped[:1] in ("{", "["))
+        gyro_units, accel_units = self._units(is_json)
         try:
-            data, _ = self._sock.recvfrom(4096)
-        except TimeoutError:
-            return None
-        now = time.monotonic_ns()
-        for line in data.decode("ascii", errors="replace").splitlines():
-            sample = parse_line(line, now, gyro_units=o.gyro_units, accel_units=o.accel_units)
-            if sample is not None:
-                self._pending.append(sample)
-        return self._pending.pop(0) if self._pending else None
+            if is_json:
+                self._handle_json(text, now, gyro_units, accel_units)
+            else:
+                for line in text.splitlines():
+                    sample = parse_line(
+                        line, now, gyro_units=gyro_units, accel_units=accel_units
+                    )
+                    if sample is not None:
+                        self._pending.append(sample)
+                        self._counters["samples"] += 1
+        except (ValueError, TypeError) as exc:
+            # One bad packet must not end the stream: count it and keep listening.
+            self._counters["parse_errors"] += 1
+            self.last_error = f"bad packet from {sender[0]}: {exc}"
+
+    def _handle_json(
+        self, text: str, now: int, gyro_units: GyroUnits, accel_units: AccelUnits
+    ) -> None:
+        o: UdpImuOptions = self.options
+        batch: list[tuple[ImuSample, int | None]] = []
+        for obj in iter_json_objects(text):
+            if isinstance(obj, dict) and obj.get("type") not in (None, "imu"):
+                self._counters["other_messages"] += 1  # e.g. a status message
+                continue
+            record = parse_json_record(
+                obj, now, gyro_units=gyro_units, accel_units=accel_units
+            )
+            if o.expected_device_id is not None and record.device_id != o.expected_device_id:
+                self._counters["wrong_device"] += 1
+                continue
+            self.emulated = self.emulated or record.emulated
+            if record.sequence is not None:
+                last = self._last_sequence
+                if last is not None:
+                    if record.sequence <= last:
+                        if last - record.sequence > 1000:  # the device restarted
+                            self._counters["device_restarts"] += 1
+                        else:
+                            self._counters["out_of_order"] += 1
+                            continue
+                    elif record.sequence > last + 1:
+                        self._counters["dropped"] += record.sequence - last - 1
+                self._last_sequence = record.sequence
+            if record.sample is None:
+                self._counters["invalid"] += 1
+                continue
+            if record.device_time_us is not None and o.device_clock:
+                self._clock.update(record.device_time_us, now)
+                batch.append((record.sample, record.device_time_us))
+            else:
+                batch.append((record.sample, None))
+        # Map only after the whole datagram updated the clock: its readings share one
+        # receive time, and the newest of them bounds the offset best.
+        for sample, device_us in batch:
+            capture_ns = self._clock.map(device_us) if device_us is not None else None
+            if capture_ns is not None:
+                sample = _with_capture(sample, capture_ns)
+            self._pending.append(sample)
+            self._counters["samples"] += 1
+
+    def stats(self) -> dict[str, Any]:
+        out: dict[str, Any] = dict(self._counters)
+        if self._clock.excess_delay_ns is not None:
+            out["clock_excess_delay_ms"] = self._clock.excess_delay_ns / 1e6
+        if self._clock.resets:
+            out["clock_resets"] = self._clock.resets
+        if self.last_sender is not None:
+            out["sender"] = f"{self.last_sender[0]}:{self.last_sender[1]}"
+        if self.emulated:
+            out["emulated"] = True
+        return out
 
     def close(self) -> None:
         if self._sock is not None:
             self._sock.close()
             self._sock = None
+
+
+def _with_capture(sample: ImuSample, capture_ns: int) -> ImuSample:
+    return dataclasses.replace(sample, capture_ns=capture_ns)
 
 
 IMU_SOURCES: dict[str, type[ImuSource]] = {

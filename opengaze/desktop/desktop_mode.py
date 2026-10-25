@@ -2,7 +2,7 @@
 
 No fullscreen window. The same ``GazeLoop`` as the test environment runs in the
 background; the macOS cursor follows your gaze and eye gestures fire their
-``gestures:`` bindings (by default a long blink clicks, a held wink drags) in
+``gestures:`` bindings (by default a double blink left-clicks, a held wink drags) in
 whichever app is under the cursor. A click-through overlay draws the gesture
 progress ring around the cursor, and the voice bar floats on top so dictation
 and read-aloud are a gaze-click away.

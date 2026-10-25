@@ -8,7 +8,7 @@ Flow
 2. Fullscreen window opens.
 3. Gaze dot tracks eye position.
 4. Eye gestures (blinks, winks, glances) fire their keybinds from ``gestures:`` in the app
-   config; the default binds a long blink to a click.
+   config; the default binds a double blink to a left click.
 5. Tab toggles real cursor control on/off (key/mouse bindings only act while it's on).
 6. C re-runs calibration; A runs adaptive calibration (dots until accurate).
 7. Space pauses/resumes.
@@ -43,7 +43,6 @@ from opengaze.debug.trace import CursorTick, TraceWriter, run_header, tick_recor
 from opengaze.gaze.loop import GazeLoop
 from opengaze.gaze.tracker import GazeTracker
 from opengaze.gestures.bindings import ActionDispatcher
-from opengaze.gestures.types import Gesture
 from opengaze.modes import profile_schema
 
 log = logging.getLogger("opengaze.run_ui")
@@ -300,10 +299,10 @@ class GazeTestWindow(QWidget):
                 name += f" ({event.phase})"
             self._last_gesture = f"{name} → {binding} ({result.outcome})"
             self._last_gesture_until = time.monotonic() + 1.5
-            is_click = result.outcome == "done" and (
-                result.binding.mouse == "click"
-                if result.binding is not None
-                else event.gesture is Gesture.LONG_BLINK
+            is_click = (
+                result.outcome == "done"
+                and result.binding is not None
+                and result.binding.mouse == "click"
             )
             if is_click:
                 self._clicks += 1

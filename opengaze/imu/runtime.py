@@ -12,12 +12,14 @@ import collections
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
 from opengaze.imu.fusion import ImuOrientation
 from opengaze.imu.sources import ImuSource, make_imu_source
+from opengaze.imu.types import ImuSample, check_units
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +30,10 @@ class ImuHealth:
     samples: int
     rate_hz: float | None
     last_error: str | None
+    last_sample_age_ms: float | None = None
+    # Transport counters from the source (packets, dropped, invalid, parse_errors, …).
+    transport: dict[str, Any] = field(default_factory=dict)
+    units_warning: str | None = None
 
 
 class ImuRuntime:
@@ -52,7 +58,8 @@ class ImuRuntime:
         self._samples = 0
         self._state = "stopped"
         self._last_error: str | None = None
-        self.last_sample = None
+        self.last_sample: ImuSample | None = None
+        self._recent: collections.deque[ImuSample] = collections.deque(maxlen=512)
 
     @classmethod
     def from_config(cls, config) -> ImuRuntime:  # config: ImuConfig
@@ -106,16 +113,28 @@ class ImuRuntime:
             finally:
                 self.source.close()
 
-    def push(self, sample) -> None:
+    def push(self, sample: ImuSample) -> None:
         """Integrate one reading (called by the thread; tests call it directly)."""
         rot = self.orientation.update(sample)
         self.last_sample = sample
         self._samples += 1
-        if rot is None:
-            return
         with self._lock:
-            self._times.append(sample.host_receive_ns)
+            self._recent.append(sample)
+            if rot is None:
+                return
+            # Device times mapped to the host clock can step back slightly when the clock
+            # sync finds a smaller offset; keep the history sorted for bisect.
+            t = sample.timestamp_ns
+            if self._times and t < self._times[-1]:
+                t = self._times[-1]
+            self._times.append(t)
             self._poses.append(rot)
+
+    def recent(self, n: int = 512) -> list[ImuSample]:
+        """The newest ``n`` raw readings, oldest first (for plots and unit checks)."""
+        with self._lock:
+            items = list(self._recent)
+        return items[-n:]
 
     # ------------------------------------------------------------------
 
@@ -140,13 +159,43 @@ class ImuRuntime:
 
     def health(self) -> ImuHealth:
         with self._lock:
-            times = list(self._times)[-200:]
+            recent = list(self._recent)[-200:]
+        # Rate from the raw device clock when the device sends one: host receive times bunch
+        # up whenever this thread is briefly starved and reads several queued datagrams at
+        # once, and mapped times step while the clock sync settles.
+        # Age and staleness use host receive times: they measure the link.
+        times = [s.host_receive_ns for s in recent]
+        device = [s.device_time_s for s in recent]
         rate = None
-        if len(times) > 1 and times[-1] > times[0]:
-            rate = (len(times) - 1) / ((times[-1] - times[0]) / 1e9)
+        if len(recent) > 1:
+            if all(t is not None for t in device) and device[-1] > device[0]:  # type: ignore[operator]
+                rate = (len(device) - 1) / (device[-1] - device[0])  # type: ignore[operator]
+            elif times[-1] > times[0]:
+                rate = (len(times) - 1) / ((times[-1] - times[0]) / 1e9)
+        now = time.monotonic_ns()
+        age_ms = (now - times[-1]) / 1e6 if times else None
         state = self._state
-        if state == "streaming" and (
-            not times or time.monotonic_ns() - times[-1] > self.stale_timeout_ns
-        ):
+        if state == "streaming" and (not times or now - times[-1] > self.stale_timeout_ns):
             state = "stalled"
-        return ImuHealth(state, self._samples, rate, self._last_error)
+        transport = self.source.stats()
+        error = self._last_error or getattr(self.source, "last_error", None)
+        return ImuHealth(
+            state,
+            self._samples,
+            rate,
+            error,
+            last_sample_age_ms=age_ms,
+            transport=transport,
+            units_warning=check_units(recent) if recent and recent[-1].source_kind == "live"
+            else None,
+        )
+
+
+def start_profile_imu(profile) -> ImuRuntime | None:  # profile: HardwareProfile
+    """Start the profile's IMU if it has an enabled one (diagnostics show it in any mode)."""
+    imu_cfg = profile.imu
+    if imu_cfg is None or not imu_cfg.enabled:
+        return None
+    runtime = ImuRuntime.from_config(imu_cfg)
+    runtime.start()
+    return runtime

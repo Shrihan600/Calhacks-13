@@ -61,6 +61,12 @@ class CameraHealth:
     capabilities: CameraCapabilities | None
 
 
+def is_emulated(health: CameraHealth) -> bool:
+    """True for a live adapter talking to an emulated device (``opengaze fake-esp32``)."""
+    caps = health.capabilities
+    return caps is not None and any(n.startswith("EMULATED") for n in caps.notes)
+
+
 class _Slot:
     def __init__(self, source: CameraSource) -> None:
         self.source = source
