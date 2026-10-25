@@ -18,6 +18,7 @@ You look at the screen. The software tracks where your eyes are pointing and mov
 | On-screen gaze keyboard | **Working** |
 | Voice dictation — Cartesia Ink-Whisper STT | **Working** (opt-in, needs API key) |
 | Speak typed text — Cartesia Sonic TTS (macOS `say` offline) | **Working** |
+| System-wide voice bar — dictate into any app, read any selection aloud | **Working** |
 | Target practice game | **Working** |
 | Eye-camera glasses support (Mode C) | Architecture ready, hardware pending |
 | AAC communication board + Claude AI | Planned |
@@ -189,18 +190,38 @@ Typing by gaze takes about 2–5 seconds per letter. Many people who need eye-ga
 
 Without both a key and the opt-in, nothing is sent anywhere: `SPEAK` uses macOS `say`, and `MIC` shows a message explaining how to enable it.
 
+### System-wide voice bar
+
+```bash
+.venv/bin/opengaze dictate --cloud
+```
+
+A small bar floats at the top of the screen, over every app, Space and full-screen window:
+
+| Action | Hotkey | Or click |
+|---|---|---|
+| Dictate into the focused app (Ink-Whisper). Recording stops when you pause | `⌃⌥D` (Control-Option-D) | 🎤 |
+| Read the selected text aloud (Sonic). Press again to stop | `⌃⌥S` | 🔊 |
+
+The transcript is typed into whatever app had focus: Notes, Messages, Slack, a browser text box, anything. Clicking the bar doesn't take focus away from that app; the hint line shows where text will go. Drag the bar to move it, right-click to quit, or press Ctrl+C in the terminal.
+
+Typing and hotkeys need **Accessibility** permission for the app you launch from (Terminal, iTerm or VS Code): System Settings › Privacy & Security › Accessibility. Without it, transcripts are copied to the clipboard for ⌘V instead.
+
 **Cartesia features used:**
 
 | Feature | Endpoint | Used for |
 |---|---|---|
-| Ink-Whisper speech-to-text (batch) | `POST /stt` | `MIC` dictation into the keyboard buffer |
-| Sonic-3.6 text-to-speech (raw PCM, 24 kHz) | `POST /tts/bytes` | `SPEAK` reads typed or dictated text aloud |
+| Ink-Whisper speech-to-text (batch) | `POST /stt` | `MIC` dictation on the gaze keyboard; system-wide dictation |
+| Sonic-3.6 text-to-speech (raw PCM, 24 kHz) | `POST /tts/bytes` | `SPEAK` on the gaze keyboard; reading selected text aloud |
 
 The code is in `opengaze/voice/`: `cartesia.py` (stdlib-only REST client), `audio.py` (mic capture with end-of-speech detection), `service.py` (non-blocking state machine the UI polls each frame).
 
 **Known limitations:**
 
 - Dictation is batch: words appear after you stop talking (usually under a second or two), not while you speak
+- The system-wide bar's hotkeys are fixed (⌃⌥D / ⌃⌥S) and assume key positions on a US layout
+- The gaze test window is fullscreen, so gaze-clicking the bar while using other apps needs a system-wide gaze cursor mode (not built yet). The hotkeys and a normal mouse work today
+- Cartesia's batch `/stt` occasionally stalls; requests time out after 10 s and retry once
 - End-of-speech detection uses a fixed loudness threshold, so a noisy room may keep it listening until the 20 s cap
 - No offline speech-to-text fallback; if Cartesia is unreachable, an error shows and you type instead
 - English is the default; other languages need `CARTESIA_LANGUAGE`

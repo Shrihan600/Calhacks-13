@@ -14,7 +14,11 @@ that data on the Mac and short-lived.
   - The microphone opens only when the user activates `MIC`, a red indicator shows while it
     listens, and it closes automatically after a pause (20 s hard cap). The recording is held in
     memory, sent to Cartesia `/stt`, and discarded. It is never written to disk.
-  - Only text the user activates `SPEAK` on is sent to Cartesia `/tts/bytes`.
+  - Only text the user activates `SPEAK` on (or selects and triggers ⌃⌥S on, in the voice bar)
+    is sent to Cartesia `/tts/bytes`. The returned audio is written to a temp file for `afplay`
+    and deleted when playback ends or stops.
+  - The system-wide voice bar reads the selection by sending ⌘C, then restores the previous
+    clipboard text.
   - With the flag off or no key, `SPEAK` uses the on-device macOS voice and nothing is sent.
 - **No credentials in the repository.** `.env` is git-ignored. `.env.example` lists the variables,
   all empty.

@@ -1,7 +1,11 @@
 """VoiceService: non-blocking dictation and speech for the gaze UIs.
 
 The UI calls ``poll()`` from its timer tick; all network and audio work runs
-on background threads so gaze tracking never stalls.
+on background threads or child processes so gaze tracking never stalls.
+
+Playback goes through macOS ``afplay`` in its own process rather than a Python
+audio callback: with MediaPipe and Qt painting holding the GIL, an in-process
+callback underruns and the voice stutters on and off.
 
 Cartesia is used only when the user has opted into cloud features
 (``privacy.cloud_features_enabled``) *and* a ``CARTESIA_API_KEY`` is set.
@@ -10,14 +14,15 @@ Otherwise speaking falls back to macOS ``say`` and dictation is unavailable.
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import logging
+import os
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
-
-import numpy as np
 
 from opengaze.voice.audio import MicRecorder
 from opengaze.voice.cartesia import (
@@ -25,6 +30,7 @@ from opengaze.voice.cartesia import (
     CartesiaClient,
     CartesiaConfig,
     CartesiaError,
+    pcm16_to_wav,
 )
 
 log = logging.getLogger("opengaze.voice")
@@ -52,8 +58,8 @@ class VoiceService:
         self._lock = threading.Lock()
         self._transcripts: deque[str] = deque()
         self._state = VoiceState.IDLE
-        self._speak_until = 0.0
-        self._say_proc: subprocess.Popen | None = None
+        self._player: subprocess.Popen | None = None
+        self._player_file: str | None = None
         self._gen = 0  # bumps on cancel so stale worker results are dropped
         if self._client:
             self.status = "Voice: Cartesia (Ink-Whisper + Sonic)"
@@ -150,11 +156,12 @@ class VoiceService:
             self.cancel()
         self.stop_speaking()
         self._state = VoiceState.SPEAKING
+        gen = self._gen
         if self._client is None:
-            self._speak_local(text)
+            self._start_player(["say", text], gen)
+            self.status = "Speaking (macOS voice)"
             return
         self.status = "Speaking with Cartesia Sonic…"
-        gen = self._gen
         threading.Thread(target=self._speak_worker, args=(text, gen), daemon=True).start()
 
     def _speak_worker(self, text: str, gen: int) -> None:
@@ -163,46 +170,47 @@ class VoiceService:
             pcm = self._client.synthesize(text)
         except CartesiaError as exc:
             log.warning("synthesize failed, falling back to say: %s", exc)
-            if gen == self._gen:
-                self._speak_local(text)
+            if self._start_player(["say", text], gen):
                 self.status = f"Cartesia unavailable ({exc}) — used macOS voice"
             return
-        if gen != self._gen or not pcm:
+        if not pcm:
             return
-        try:
-            import sounddevice as sd
+        fd, path = tempfile.mkstemp(prefix="opengaze-tts-", suffix=".wav")
+        with os.fdopen(fd, "wb") as f:
+            f.write(pcm16_to_wav(pcm, TTS_SAMPLE_RATE))
+        if not self._start_player(["afplay", path], gen, path):
+            os.unlink(path)
 
-            samples = np.frombuffer(pcm, dtype="<i2")
-            sd.play(samples, TTS_SAMPLE_RATE)
-            self._speak_until = time.monotonic() + len(samples) / TTS_SAMPLE_RATE
-        except Exception as exc:
-            log.warning("playback failed: %s", exc)
-            self._state = VoiceState.IDLE
-            self.status = f"Audio output failed: {exc}"
+    def _start_player(self, cmd: list[str], gen: int, path: str | None = None) -> bool:
+        """Start playback unless cancelled meanwhile. Returns True if started."""
+        with self._lock:
+            if gen != self._gen:
+                return False
+            try:
+                self._player = subprocess.Popen(cmd)
+            except Exception as exc:
+                log.warning("playback failed: %s", exc)
+                self._state = VoiceState.IDLE
+                self.status = f"Audio output failed: {exc}"
+                return False
+            self._player_file = path
+            return True
 
-    def _speak_local(self, text: str) -> None:
-        try:
-            self._say_proc = subprocess.Popen(["say", text])
-            self.status = "Speaking (macOS voice)"
-        except Exception as exc:
-            self._state = VoiceState.IDLE
-            self.status = f"Speech unavailable: {exc}"
+    def _release_player(self) -> None:
+        if self._player is not None and self._player.poll() is None:
+            self._player.terminate()
+        self._player = None
+        if self._player_file:
+            with contextlib.suppress(OSError):
+                os.unlink(self._player_file)
+            self._player_file = None
 
     def stop_speaking(self) -> None:
-        if self._say_proc is not None and self._say_proc.poll() is None:
-            self._say_proc.terminate()
-        self._say_proc = None
-        if self._speak_until:
-            try:
-                import sounddevice as sd
-
-                sd.stop()
-            except Exception:
-                pass
-            self._speak_until = 0.0
-        if self._state is VoiceState.SPEAKING:
-            self._gen += 1
-            self._state = VoiceState.IDLE
+        with self._lock:
+            self._release_player()
+            if self._state is VoiceState.SPEAKING:
+                self._gen += 1
+                self._state = VoiceState.IDLE
 
     # ------------------------------------------------------------------
     # UI integration
@@ -212,16 +220,16 @@ class VoiceService:
         """Advance timers; return any finished transcripts. Call from the UI thread."""
         if self._state is VoiceState.LISTENING and self._recorder.should_stop():
             self._finish_listening()
-        elif self._state is VoiceState.SPEAKING:
-            done_say = self._say_proc is not None and self._say_proc.poll() is not None
-            done_pcm = self._speak_until and time.monotonic() >= self._speak_until
-            if done_say or done_pcm:
-                self._say_proc = None
-                self._speak_until = 0.0
+        with self._lock:
+            if (
+                self._state is VoiceState.SPEAKING
+                and self._player is not None
+                and self._player.poll() is not None
+            ):
+                self._release_player()
                 self._state = VoiceState.IDLE
                 if self.status.startswith("Speaking"):
                     self.status = f"Voice: {self.engine} — ready"
-        with self._lock:
             out = list(self._transcripts)
             self._transcripts.clear()
         return out

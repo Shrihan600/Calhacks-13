@@ -45,8 +45,11 @@ class MicRecorder:
         self._chunks = []
         self._last_voice_t = None
         self._start_t = time.monotonic()
+        # 100 ms blocks + high latency: the callback needs the GIL, which the
+        # gaze pipeline holds for long stretches; small blocks would overflow.
         self._stream = sd.InputStream(
             samplerate=self.sample_rate, channels=1, dtype="int16",
+            blocksize=self.sample_rate // 10, latency="high",
             callback=lambda data, *_: self._on_chunk(data[:, 0].copy(), time.monotonic()),
         )
         self._stream.start()

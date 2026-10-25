@@ -266,6 +266,38 @@ def cmd_voice_test(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dictate(args: argparse.Namespace) -> int:
+    """System-wide voice bar: dictate into any app, read selections aloud."""
+    from opengaze.voice.cartesia import CartesiaConfig
+    from opengaze.voice.service import VoiceService
+
+    config = _with_cloud_flag(load_app_config(args.config), args)
+    configure_logging(args.log_level or "WARNING")
+    if sys.platform != "darwin":
+        print("system-wide dictation is macOS-only")
+        return 1
+    try:
+        from opengaze.desktop.dictation_ui import run_dictation_bar
+    except ImportError as exc:
+        print(f"desktop UI unavailable ({exc}); install with: pip install -e '.[desktop]'")
+        return 1
+    from opengaze.control.cursor import is_accessibility_granted
+
+    voice = VoiceService(
+        cloud_enabled=config.privacy.cloud_features_enabled,
+        cartesia=CartesiaConfig.from_env(),
+    )
+    print(voice.status)
+    if not voice.can_dictate:
+        print("Dictation is off; run with --cloud and set CARTESIA_API_KEY in .env.")
+    if not is_accessibility_granted():
+        print("Accessibility permission is missing for this terminal app, so hotkeys and\n"
+              "typing into other apps won't work (transcripts go to the clipboard instead).\n"
+              "Grant it in System Settings › Privacy & Security › Accessibility, then rerun.")
+    print("Voice bar is up. ⌃⌥D = dictate, ⌃⌥S = read selection, Ctrl+C here to quit.")
+    return run_dictation_bar(voice)
+
+
 def cmd_calibrate(args: argparse.Namespace) -> int:
     config, report = _load(args)
     if not report.ok:
@@ -359,6 +391,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text", default="Hi, I'm using OpenGaze to talk with my eyes.",
                    help="sentence to speak in the TTS step")
     p.set_defaults(func=cmd_voice_test)
+
+    p = sub.add_parser("dictate", help="system-wide voice bar: dictate into any app (Cartesia)")
+    p.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="app config YAML")
+    p.add_argument("--cloud", action="store_true",
+                   help="opt into Cartesia voice for this session")
+    p.set_defaults(func=cmd_dictate)
 
     p = sub.add_parser("calibrate", help="run the 9-point gaze calibration wizard (PySide6)")
     add_profile_args(p)

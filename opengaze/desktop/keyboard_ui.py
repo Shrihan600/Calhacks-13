@@ -39,6 +39,9 @@ ROWS: list[list[str]] = [
 _SPECIAL_W = {"MIC": 2, "SPACE": 3, "⌫": 1.5, "CLEAR": 1.5, "SPEAK": 2}
 # Toggle-style keys fire once per look; gaze must leave the key (or blink) to fire again.
 _ACTION_KEYS = {"MIC", "SPEAK"}
+# Gaze must stay off a latched key this long before it can dwell-fire again, so
+# jitter onto a neighbouring key and back doesn't toggle speech on and off.
+_LATCH_RELEASE_S = 0.4
 _KEY_DWELL_S = 0.8
 _KEY_COOL_S = 0.5
 
@@ -146,6 +149,7 @@ class GazeKeyboardWindow(QWidget):
         self._hit_key: str | None = None
         self._hit_until: float = 0.0
         self._latched: str | None = None
+        self._latch_off_since: float | None = None
 
         self._voice = VoiceService(
             cloud_enabled=config.privacy.cloud_features_enabled,
@@ -210,8 +214,13 @@ class GazeKeyboardWindow(QWidget):
             now = time.monotonic()
             in_cool = now < self._cool_until
 
-            if hovered != self._latched:
-                self._latched = None
+            if self._latched is not None:
+                if hovered == self._latched:
+                    self._latch_off_since = None
+                elif self._latch_off_since is None:
+                    self._latch_off_since = now
+                elif now - self._latch_off_since >= _LATCH_RELEASE_S:
+                    self._latched = None
 
             if hovered != self._dwell_key:
                 self._dwell_key = hovered
@@ -253,6 +262,7 @@ class GazeKeyboardWindow(QWidget):
         self._cool_until = now + _KEY_COOL_S
         if key in _ACTION_KEYS:
             self._latched = key
+            self._latch_off_since = None
 
     def _insert_dictation(self, transcript: str) -> None:
         if self._text and not self._text.endswith(" "):

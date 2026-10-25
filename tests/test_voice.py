@@ -257,3 +257,59 @@ def test_client_error_not_retried_and_message_parsed(monkeypatch):
     with pytest.raises(CartesiaError, match="HTTP 401: Invalid API key."):
         CartesiaClient(CartesiaConfig(api_key="k")).synthesize("hi")
     assert len(calls) == 1
+
+
+def test_chunk_text_respects_utf16_limit():
+    from opengaze.control.keystrokes import _utf16_len, chunk_text
+
+    text = "Hello wörld 👋 " * 5
+    chunks = chunk_text(text, size=20)
+    assert "".join(chunks) == text
+    assert all(_utf16_len(c) <= 20 for c in chunks)
+
+
+def test_offline_speak_uses_say_and_finishes(monkeypatch):
+    import subprocess
+
+    started = []
+
+    class _Done:
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd: started.append(cmd) or _Done())
+    svc = VoiceService(cloud_enabled=False)
+    svc.speak("hello")
+    assert started == [["say", "hello"]]
+    svc.poll()
+    assert svc.state is VoiceState.IDLE
+
+
+def test_cartesia_speech_plays_out_of_process(monkeypatch):
+    import subprocess
+
+    started = []
+
+    class _Playing:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            started.append("terminated")
+
+    monkeypatch.setattr(CartesiaClient, "synthesize", lambda self, t: b"\0\0" * 2400)
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd: started.append(cmd) or _Playing())
+    svc = VoiceService(cloud_enabled=True, cartesia=CartesiaConfig(api_key="k"))
+    svc.speak("hello")
+    assert _wait(lambda: started)
+    assert started[0][0] == "afplay"
+    path = started[0][1]
+    svc.stop_speaking()
+    assert started[-1] == "terminated"
+    import os
+
+    assert not os.path.exists(path)
+    assert svc.state is VoiceState.IDLE
