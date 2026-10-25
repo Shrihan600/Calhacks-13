@@ -6,8 +6,14 @@ that data on the Mac and short-lived.
 ## What is true today (Phase 1)
 
 - **Local processing only.** Camera frames are processed in memory. Nothing is sent over the network.
-- **No recording.** No camera image is written to disk. `privacy.allow_recording` defaults to
-  `false`, and no recording feature exists yet.
+- **No recording by default.** No camera image is written to disk unless
+  `privacy.allow_recording: true` is set *and* the session is started with
+  `opengaze run --record-video`. While it records, the window shows **● REC VIDEO**. Sessions
+  (eye video, calibration, trace) go to `~/.config/opengaze/sessions/`; delete the folder to
+  delete the recording.
+- **Traces hold features, not images.** `opengaze run --trace` writes eye-feature values,
+  gaze positions and cursor positions per frame to `~/.config/opengaze/traces/`. That is
+  still eye-movement data: keep traces local like calibrations.
 - **No cloud features.** The Claude, Cartesia and Convex modules haven't been built yet.
   `privacy.cloud_features_enabled` defaults to `false`.
 - **No credentials in the repository.** `.env` is git-ignored. `.env.example` lists the variables,

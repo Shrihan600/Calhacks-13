@@ -7,6 +7,7 @@ import time
 import numpy as np
 
 from opengaze.gaze.pipelines import EyeResult
+from opengaze.vision.feature_extractor import write_head
 from opengaze.vision.observations import FEATURE_LAYOUTS, FeatureVector, HeadObservation
 
 
@@ -21,7 +22,8 @@ def build_eye_features(
     """Pack eye results into the schema's layout (see ``FEATURE_LAYOUTS``).
 
     An eye's slots are valid only when it is open and its feature exists (for ``eye_3d``, once
-    the eye model is fitted). Head slots are valid when a head observation is present.
+    the eye model is fitted). Head rotation and head position slots are valid independently
+    (an IMU gives rotation but no position).
     """
     layout = FEATURE_LAYOUTS[schema_id]
     v = np.zeros(layout.width, dtype=np.float32)
@@ -39,17 +41,7 @@ def build_eye_features(
         ok[cols] = True
         ok[layout.eye_conf[side]] = True
 
-    if head is not None:
-        cols = list(layout.head)
-        v[cols] = (
-            head.yaw_deg,
-            head.pitch_deg,
-            head.roll_deg,
-            head.face_center_x_norm,
-            head.face_center_y_norm,
-            head.relative_scale,
-        )
-        ok[cols] = True
+    write_head(v, ok, layout, head)
 
     stamps = [o.t_ns for o in (head, left, right) if o is not None]
     if t_ns is None:

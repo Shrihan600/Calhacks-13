@@ -4,32 +4,35 @@ Every desktop window (test environment, keyboard, practice) runs the same loop, 
 here instead of being copied into each window.
 
 * Gaze freezes while either eye is closed: pupil position is unreliable as the lid moves, and
-  a blink/wink gesture should act at the pre-blink position.
+  a blink/wink gesture should act at the pre-blink position. The exception is
+  ``track_one_eye`` (set while a held wink holds the mouse button down): then gaze follows the
+  open eye, so the held button drags. The mapper falls back to that eye's sub-model, since
+  a closed eye's features are marked invalid.
 * Gestures see the *unclipped, unsmoothed* gaze, so glances past the screen edge are
   detectable and not delayed by the filter.
+* Every tick that doesn't move the gaze says why (``GazeState.drop_reason``), so a cursor
+  that won't move can be traced to the stage that stopped it.
 """
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
+from typing import Literal
 
 from opengaze.calibration.model import ScreenMapper
-from opengaze.calibration.session import GRID_HI, GRID_LO
 from opengaze.control.filter import OneEuroFilter
 from opengaze.gaze.tracker import GazeTracker, TrackerFrame
 from opengaze.gestures.config import GestureSettings
 from opengaze.gestures.recognizer import GestureFrame, GestureRecognizer
 from opengaze.gestures.types import EyeSignal
 
+log = logging.getLogger(__name__)
 
-def expand(v: float) -> float:
-    """Remap the Mode A ridge output range [GRID_LO, GRID_HI] → [0, 1] (unclipped).
-
-    Ridge shrinkage compresses Mode A predictions toward the centre; Modes B/C mappers are
-    fitted with much less regularisation and are used as is.
-    """
-    return (v - GRID_LO) / (GRID_HI - GRID_LO)
+DropReason = Literal[
+    "no_model", "no_frames", "eye_closed", "predict_error", "no_prediction", "low_confidence"
+]
 
 
 @dataclass
@@ -40,6 +43,8 @@ class GazeState:
     confidence: float
     gesture: GestureFrame
     updated: bool  # gaze moved on this tick (False while frozen / low confidence / no model)
+    raw: tuple[float, float] | None = None  # unclipped, unsmoothed model output
+    drop_reason: DropReason | None = None   # why the gaze didn't move (None when updated)
 
 
 class GazeLoop:
@@ -59,10 +64,10 @@ class GazeLoop:
         self.min_confidence = min_confidence
         self._fx = OneEuroFilter(filter_min_cutoff, filter_beta)
         self._fy = OneEuroFilter(filter_min_cutoff, filter_beta)
-        self._expand = tracker.is_mode_a
         self.gaze_x = 0.5
         self.gaze_y = 0.5
         self.confidence = 0.0
+        self.track_one_eye = False  # keep tracking with one eye closed (drag in progress)
 
     def reset(self) -> None:
         self._fx.reset()
@@ -72,26 +77,41 @@ class GazeLoop:
     def tick(self, manager: object, t: float | None = None) -> GazeState:
         t = time.monotonic() if t is None else t
         frame = self.tracker.step(manager)
+        both_closed = bool(frame.left_closed) and bool(frame.right_closed)
         any_closed = bool(frame.left_closed) or bool(frame.right_closed)
+        frozen = both_closed or (any_closed and not self.track_one_eye)
 
         raw: tuple[float, float] | None = None
         updated = False
+        reason: DropReason | None = None
         fv = frame.features
-        if self.model is not None and fv is not None and not any_closed:
+        if self.model is None:
+            reason = "no_model"
+        elif fv is None:
+            reason = "no_frames"
+        elif frozen:
+            reason = "eye_closed"
+        else:
             try:
                 sample = self.model.predict(fv)
-            except Exception:
-                sample = None
-            if sample is not None and sample.confidence >= self.min_confidence:
-                rx = sample.raw_x_norm if sample.raw_x_norm is not None else sample.screen_x_norm
-                ry = sample.raw_y_norm if sample.raw_y_norm is not None else sample.screen_y_norm
-                if self._expand:
-                    rx, ry = expand(rx), expand(ry)
-                raw = (rx, ry)
-                self.confidence = sample.confidence
-                self.gaze_x = min(1.0, max(0.0, self._fx(min(1.0, max(0.0, rx)), t)))
-                self.gaze_y = min(1.0, max(0.0, self._fy(min(1.0, max(0.0, ry)), t)))
-                updated = True
+            except Exception as exc:
+                log.debug("predict failed: %s", exc)
+                sample, reason = None, "predict_error"
+            if sample is not None:
+                if sample.confidence <= 0.0 and sample.raw_x_norm is None:
+                    reason = "no_prediction"  # the valid features couldn't support one
+                elif sample.confidence < self.min_confidence:
+                    reason = "low_confidence"
+                    self.confidence = sample.confidence
+                else:
+                    rx, ry = sample.raw_x_norm, sample.raw_y_norm
+                    if rx is None or ry is None:
+                        rx, ry = sample.screen_x_norm, sample.screen_y_norm
+                    raw = (rx, ry)
+                    self.confidence = sample.confidence
+                    self.gaze_x = min(1.0, max(0.0, self._fx(min(1.0, max(0.0, rx)), t)))
+                    self.gaze_y = min(1.0, max(0.0, self._fy(min(1.0, max(0.0, ry)), t)))
+                    updated = True
 
         signal = EyeSignal(
             t,
@@ -101,7 +121,9 @@ class GazeLoop:
             raw[1] if raw else None,
         )
         gesture = self.recognizer.update(signal)
-        return GazeState(frame, self.gaze_x, self.gaze_y, self.confidence, gesture, updated)
+        return GazeState(
+            frame, self.gaze_x, self.gaze_y, self.confidence, gesture, updated, raw, reason
+        )
 
 
 def clicked(state: GazeState, settings: GestureSettings) -> bool:

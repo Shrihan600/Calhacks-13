@@ -144,13 +144,23 @@ incompatible, the same way a geometry change is.
 ```
 eye camera ─▶ normalize ─▶ PupilDetector2D ─────────────────────────▶ pupil centre ─┐  pupil_2d
                                  └──▶ EyeModel3D (learns, then frozen) ─▶ gaze vector ─┤  eye_3d
-head camera ─▶ normalize ─▶ MediaPipe ─▶ HeadObservation ─────────────────────────────┤
+head camera ─▶ normalize ─▶ MediaPipe ─▶ head pose (Mode A; B/C: yaw anchor + position) ┤
+IMU ─▶ ImuRuntime (Mahony + bias) ─▶ HeadPoseFusion ─▶ head rotation (Modes B/C) ─────┤
                                                                                       ▼
                      FeatureVector(schema) ─▶ ScreenMapper ─▶ OneEuro ─▶ cursor / gestures
                                               ├ GazeModel             (Mode A, linear ridge)
                                               ├ PolynomialRidgeMapper (B/C, data_driven)
                                               └ GeometricRayMapper    (B/C eye_3d, geometric)
 ```
+
+Head pose feeds the mappers as two parts that are valid independently: rotation (yaw, pitch,
+roll) and position (x, y, z cm). In Mode A both come from the webcam (`vision/head_pose.py`),
+and the eye feature is the iris direction *within the head*. In Modes B/C rotation comes from
+the head-mounted IMU (`imu/`: sources → Mahony filter with variance-gated gyro-bias learning
+→ `ImuRuntime` thread → `HeadPoseFusion`, which anchors yaw and pulls it toward the webcam
+when a face is visible), and position comes from the webcam when there is one. The
+`FEATURE_LAYOUT_VERSION` in calibration files changed to 2 with this. Older Mode A
+calibrations are reported as incompatible and must be redone.
 
 `GazeTracker` (`gaze/tracker.py`) runs the vision front end for any mode. `GazeLoop`
 (`gaze/loop.py`) adds the mapper, smoothing and gesture recognition, and every desktop window

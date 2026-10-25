@@ -89,7 +89,16 @@ class BlinkPatternDetector:
 
 
 class WinkDetector:
-    """Left/right wink (fires on reopening) and long wink (fires while held)."""
+    """Left/right wink (fires on reopening) and long wink (fires while held).
+
+    Quick winks of the same eye form a run: each one fires as it happens, numbered by
+    ``GestureEvent.count`` (1, 2, 3, …), so a double wink can act as a double click without
+    delaying the single one. A long wink, a blink, or the other eye winking ends the run.
+
+    A wink held for ``hold_press_ms`` also emits ``hold_wink_*`` with phase "start", and the
+    matching "end" when the eye reopens, the other eye closes too, or the eye is lost — every
+    start gets an end, so a button pressed by it is always released.
+    """
 
     def __init__(self, settings: WinkSettings | None = None) -> None:
         self.s = settings or WinkSettings()
@@ -98,6 +107,11 @@ class WinkDetector:
         self._long_fired = False
         self._spoiled = False  # the other eye closed during this wink
         self._cooldown_until = 0.0
+        self._holding = False  # hold_wink_* "start" sent, "end" not yet
+        self._other_since: float | None = None  # other eye closed since (during a hold)
+        self._run_eye: str | None = None  # eye of the current run of quick winks
+        self._run_count = 0
+        self._run_end = 0.0  # when the last wink of the run reopened
 
     def progress(self, t: float) -> float:
         if self._eye is None or self._spoiled or self._long_fired:
@@ -108,8 +122,9 @@ class WinkDetector:
         s, t = self.s, sig.t
         # A wink needs both eyes observed; an unobserved eye is not "open".
         if sig.left_closed is None or sig.right_closed is None:
+            events = self._end_hold(sig.t)
             self.reset()
-            return []
+            return events
         left, right = sig.left_closed, sig.right_closed
         events: list[GestureEvent] = []
 
@@ -123,12 +138,26 @@ class WinkDetector:
 
         winking_closed = left if self._eye == "left" else right
         other_closed = right if self._eye == "left" else left
-        if other_closed:
+        if not other_closed:
+            self._other_since = None
+        elif self._holding:
+            # A natural blink of the other eye mustn't drop a drag; a long closure ends it.
+            if self._other_since is None:
+                self._other_since = t
+            if (t - self._other_since) * 1000.0 > s.hold_blink_tolerance_ms:
+                self._spoiled = True
+                events += self._end_hold(t)
+        else:
             self._spoiled = True  # turned into a blink; never report this as a wink
         if winking_closed:
             held_ms = (t - self._since) * 1000.0
+            if not self._spoiled and not self._holding and held_ms >= s.hold_press_ms:
+                self._holding = True
+                g = Gesture.HOLD_WINK_LEFT if self._eye == "left" else Gesture.HOLD_WINK_RIGHT
+                events.append(GestureEvent(g, t, phase="start"))
             if not self._spoiled and not self._long_fired and held_ms >= s.long_wink_ms:
                 self._long_fired = True
+                self._run_eye = None
                 if t >= self._cooldown_until:
                     g = Gesture.LONG_WINK_LEFT if self._eye == "left" else Gesture.LONG_WINK_RIGHT
                     events.append(GestureEvent(g, t))
@@ -136,15 +165,21 @@ class WinkDetector:
             return events
 
         # Winking eye reopened.
+        events += self._end_hold(t)
         held_ms = (t - self._since) * 1000.0
-        if (
-            not self._spoiled
-            and not self._long_fired
-            and s.min_wink_ms <= held_ms < s.long_wink_ms
-            and t >= self._cooldown_until
+        continues_run = (
+            self._run_eye == self._eye
+            and (self._since - self._run_end) * 1000.0 <= s.multi_wink_gap_ms
+        )
+        if self._spoiled or self._long_fired:
+            self._run_eye = None
+        elif s.min_wink_ms <= held_ms < s.long_wink_ms and (
+            continues_run or t >= self._cooldown_until
         ):
+            self._run_count = self._run_count + 1 if continues_run else 1
+            self._run_eye, self._run_end = self._eye, t
             g = Gesture.WINK_LEFT if self._eye == "left" else Gesture.WINK_RIGHT
-            events.append(GestureEvent(g, t))
+            events.append(GestureEvent(g, t, count=self._run_count))
             self._cooldown_until = t + s.cooldown_ms / 1000.0
         self._eye = None
         # The other eye may have started its own wink on this very frame.
@@ -152,10 +187,24 @@ class WinkDetector:
             return events + self.update(sig)
         return events
 
+    def _end_hold(self, t: float) -> list[GestureEvent]:
+        if not self._holding:
+            return []
+        self._holding = False
+        self._other_since = None
+        g = Gesture.HOLD_WINK_LEFT if self._eye == "left" else Gesture.HOLD_WINK_RIGHT
+        return [GestureEvent(g, t, phase="end")]
+
+    @property
+    def holding(self) -> bool:
+        return self._holding
+
     def reset(self) -> None:
         self._eye = None
         self._long_fired = False
         self._spoiled = False
+        self._holding = False
+        self._run_eye = None
 
 
 _GLANCE = {

@@ -40,6 +40,22 @@ hardware_profile:
       fps: 30
       mounting_position: display_top
 
+  # Head-mounted IMU (gyro + accelerometer) on the glasses frame: head rotation for Modes B/C.
+  # With the head camera also enabled, the webcam anchors yaw (cancels drift) and adds head
+  # position. Remove this section (or enabled: false) to use the webcam alone.
+  imu:
+    source_type: serial        # serial (USB) | udp (ESP32 / Pi over Wi-Fi) | synthetic
+    enabled: false             # set true once the IMU is wired up
+    options:
+      port: /dev/cu.usbmodem1101   # `ls /dev/cu.*`; for udp: {port: 5005}
+      baud: 115200
+      gyro_units: deg_s        # deg_s | rad_s
+      accel_units: g           # g | m_s2
+    # Which IMU axis points to the head's right, the chin, and forward (out of the face).
+    # Must be a proper rotation (the validator explains if not).
+    axes: ["+x", "+y", "+z"]
+    webcam_yaw_rate: 0.5       # how fast the webcam pulls IMU yaw back (0 = never)
+
   # How eye-camera images become gaze (Modes B/C). Each component is swappable by `type`.
   gaze:
     pipeline: pupil_2d           # pupil_2d: pupil centre | eye_3d: 3D eye model → gaze vector

@@ -18,4 +18,7 @@ hardware_profile:
 
   calibration:
     screen_mapping: per_user
-    geometry_estimation: data_driven
+    # geometric: gaze rays from the eye-in-head direction, rotated by the webcam's head pose
+    # and started at its head position, so moving or turning the head after calibration is
+    # compensated. data_driven learns head effects only within what calibration saw.
+    geometry_estimation: geometric

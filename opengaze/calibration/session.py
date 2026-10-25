@@ -15,7 +15,7 @@ from typing import Literal
 import numpy as np
 
 from opengaze.calibration.model import GazeModel, ScreenMapper
-from opengaze.vision.observations import FeatureVector, SchemaId
+from opengaze.vision.observations import FEATURE_LAYOUTS, FeatureVector, SchemaId
 
 MapperFactory = Callable[[], ScreenMapper]
 
@@ -29,6 +29,13 @@ GRID_9: tuple[tuple[float, float], ...] = (
 # Calibration grid min/max used to remap model output to full [0,1] screen range.
 GRID_LO: float = 0.05
 GRID_HI: float = 0.95
+
+
+def _has_eye(fv: FeatureVector) -> bool:
+    layout = FEATURE_LAYOUTS.get(fv.schema_id)
+    if layout is None or layout.width != len(fv.valid):
+        return bool(fv.valid.any())
+    return any(bool(fv.valid[list(cols)].all()) for cols in layout.eye_values.values())
 
 
 @dataclass
@@ -45,7 +52,9 @@ class CalibrationPoint:
         return len(self.samples)
 
     def _valid_samples(self) -> list[FeatureVector]:
-        return [s for s in self.samples if s.valid.any()]
+        """Samples with at least one eye feature: head pose alone (e.g. an IMU that is always
+        valid) says nothing about where the user was looking."""
+        return [s for s in self.samples if _has_eye(s)]
 
     def representative(self) -> np.ndarray | None:
         """Per-feature median over the samples where that feature was valid, as a 1-D float32

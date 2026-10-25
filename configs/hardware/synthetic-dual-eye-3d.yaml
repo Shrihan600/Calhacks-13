@@ -1,5 +1,5 @@
 # Fully simulated Mode C rig for the 3D eye-model pipeline: two eye cameras rendering a
-# rotating eyeball (the pupil foreshortens into an ellipse), plus a head camera.
+# rotating eyeball (the pupil foreshortens into an ellipse), a head camera, and an IMU.
 # Everything from this profile is labeled SYNTHETIC in the UI and in every CameraFrame.
 hardware_profile:
   id: synthetic-dual-eye-3d
@@ -38,6 +38,12 @@ hardware_profile:
       mounting_position: display_top
       options:
         pattern: test_card
+
+  # Simulated IMU on the glasses: head rotation for the gaze rays. The synthetic head camera
+  # shows a test card (no face), so this rig is IMU-only: rotation tracked, position assumed.
+  imu:
+    source_type: synthetic
+    options: {motion: sway_pause}
 
   gaze:
     pipeline: eye_3d             # 2D pupil detector → 3D eye model → gaze vector

@@ -17,6 +17,14 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from opengaze.cameras.types import CameraFrame, PixelFormat
+from opengaze.vision.head_pose import (
+    MP_LEFT_EYE_OUTER,
+    MP_LEFT_IRIS,
+    MP_RIGHT_EYE_OUTER,
+    MP_RIGHT_IRIS,
+    estimate_from_landmarks,
+    focal_px,
+)
 from opengaze.vision.observations import EyeObservation, HeadObservation
 
 if TYPE_CHECKING:
@@ -31,14 +39,9 @@ _MODEL_URL = (
     "face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
 )
 
-# MediaPipe FaceMesh landmark indices used here.
-_IRIS_LEFT = 468
-_IRIS_RIGHT = 473
-_EYE_OUTER_LEFT = 33
-_EYE_OUTER_RIGHT = 263
-
-_BLINK_LEFT = "eyeBlinkLeft"
-_BLINK_RIGHT = "eyeBlinkRight"
+# Blendshapes are named after the face MediaPipe sees (like the landmarks).
+_BLINK_MP_LEFT = "eyeBlinkLeft"
+_BLINK_MP_RIGHT = "eyeBlinkRight"
 _BLINK_THRESHOLD = 0.4  # blendshape score above this counts as a blink
 
 
@@ -70,9 +73,21 @@ class FaceLandmarkDetector:
 
     Uses MediaPipe FaceLandmarker in VIDEO mode for temporal smoothing.  Frames
     must be passed in monotonically increasing timestamp order.
+
+    ``mirrored``: the head camera's profile flips the image horizontally (as the webcam
+    profile does), which decides which eye is the user's left. ``hfov_deg`` sets the focal
+    length when the frame carries no intrinsics; it scales the head-position estimate.
     """
 
-    def __init__(self, model_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        model_path: Path | None = None,
+        *,
+        mirrored: bool = False,
+        hfov_deg: float = 60.0,
+    ) -> None:
+        self.mirrored = mirrored
+        self.hfov_deg = hfov_deg
         try:
             import mediapipe as mp
             from mediapipe.tasks.python import vision as mp_vision
@@ -111,7 +126,7 @@ class FaceLandmarkDetector:
         timestamp_ms = max(frame.timestamp_ns // 1_000_000, self._last_timestamp_ms + 1)
         self._last_timestamp_ms = timestamp_ms
         result = self._landmarker.detect_for_video(mp_image, timestamp_ms)
-        return _parse_result(result, frame)
+        return _parse_result(result, frame, self.mirrored, self.hfov_deg)
 
     def close(self) -> None:
         self._landmarker.close()
@@ -144,93 +159,89 @@ def _to_rgb(frame: CameraFrame) -> np.ndarray:
 def _parse_result(
     result: object,
     frame: CameraFrame,
+    mirrored: bool,
+    hfov_deg: float,
 ) -> tuple[HeadObservation | None, list[EyeObservation]]:
     if not result.face_landmarks:
         return None, []
 
     landmarks = result.face_landmarks[0]
+    lm = np.array([(p.x, p.y, p.z) for p in landmarks], dtype=np.float64)
     t_ns = frame.timestamp_ns
     t_unc = frame.timestamp_uncertainty_ns
     cam = frame.camera_id
+    w, h = frame.width, frame.height
 
-    # Blink scores from blendshapes (0 = open, 1 = fully closed).
-    blink_l = blink_r = 0.0
+    if frame.intrinsics is not None:
+        f, pp = frame.intrinsics.fx, (frame.intrinsics.cx, frame.intrinsics.cy)
+        if mirrored:  # intrinsics describe the unmirrored image
+            pp = (w - pp[0], pp[1])
+    else:
+        f, pp = focal_px(w, hfov_deg), None
+    pose = estimate_from_landmarks(lm, w, h, mirrored=mirrored, focal_length_px=f,
+                                   principal_point=pp)
+
+    # Blink scores from blendshapes (0 = open, 1 = fully closed), named like the landmarks.
+    blink_mp = {"left": 0.0, "right": 0.0}
     if result.face_blendshapes:
         for shape in result.face_blendshapes[0]:
-            if shape.category_name == _BLINK_LEFT:
-                blink_l = shape.score
-            elif shape.category_name == _BLINK_RIGHT:
-                blink_r = shape.score
+            if shape.category_name == _BLINK_MP_LEFT:
+                blink_mp["left"] = shape.score
+            elif shape.category_name == _BLINK_MP_RIGHT:
+                blink_mp["right"] = shape.score
 
-    iris_l = landmarks[_IRIS_LEFT]
-    iris_r = landmarks[_IRIS_RIGHT]
+    # User's eye → (MediaPipe iris index, MediaPipe side). Mirrored, MediaPipe's right is the
+    # user's left.
+    if mirrored:
+        user_eyes = {"left": (MP_RIGHT_IRIS, "right"), "right": (MP_LEFT_IRIS, "left")}
+    else:
+        user_eyes = {"left": (MP_LEFT_IRIS, "left"), "right": (MP_RIGHT_IRIS, "right")}
 
-    # Inter-ocular distance (normalised image units) used for radius proxy + scale.
-    outer_l = landmarks[_EYE_OUTER_LEFT]
-    outer_r = landmarks[_EYE_OUTER_RIGHT]
+    outer_l, outer_r = landmarks[MP_RIGHT_EYE_OUTER], landmarks[MP_LEFT_EYE_OUTER]
     iod = float(np.hypot(outer_l.x - outer_r.x, outer_l.y - outer_r.y))
-    pupil_radius = iod * 0.07  # iris ≈ 7% of IOD (heuristic)
+    pupil_radius = iod * 0.07  # iris ≈ 7% of the eye-corner span (heuristic)
 
-    eyes = [
-        EyeObservation(
-            camera_id=cam,
-            eye="left",
-            t_ns=t_ns,
-            t_uncertainty_ns=t_unc,
-            pupil_x_norm=float(iris_l.x),
-            pupil_y_norm=float(iris_l.y),
-            pupil_radius_norm=pupil_radius,
-            blink=blink_l > _BLINK_THRESHOLD,
-            confidence=max(0.0, 1.0 - blink_l),
-            detector="mediapipe_face_landmarker",
-        ),
-        EyeObservation(
-            camera_id=cam,
-            eye="right",
-            t_ns=t_ns,
-            t_uncertainty_ns=t_unc,
-            pupil_x_norm=float(iris_r.x),
-            pupil_y_norm=float(iris_r.y),
-            pupil_radius_norm=pupil_radius,
-            blink=blink_r > _BLINK_THRESHOLD,
-            confidence=max(0.0, 1.0 - blink_r),
-            detector="mediapipe_face_landmarker",
-        ),
-    ]
-
-    head: HeadObservation | None = None
-    mats = result.facial_transformation_matrixes
-    if mats:
-        mat = np.asarray(mats[0], dtype=np.float64)
-        if mat.shape == (4, 4):
-            yaw, pitch, roll = _rotation_to_euler_deg(mat[:3, :3])
-            cx = (float(iris_l.x) + float(iris_r.x)) / 2
-            cy = (float(iris_l.y) + float(iris_r.y)) / 2
-            head = HeadObservation(
+    eyes = []
+    for side, (iris_idx, mp_side) in user_eyes.items():
+        iris = landmarks[iris_idx]
+        score = blink_mp[mp_side]
+        gaze = None
+        if pose is not None and side in pose.eye_dirs:
+            gaze = tuple(float(c) for c in pose.eye_dirs[side])
+        eyes.append(
+            EyeObservation(
+                camera_id=cam,
+                eye=side,  # type: ignore[arg-type]
                 t_ns=t_ns,
                 t_uncertainty_ns=t_unc,
-                yaw_deg=yaw,
-                pitch_deg=pitch,
-                roll_deg=roll,
-                face_center_x_norm=cx,
-                face_center_y_norm=cy,
-                relative_scale=iod,
-                confidence=1.0,
-                transform_4x4=mat,
+                pupil_x_norm=float(iris.x),
+                pupil_y_norm=float(iris.y),
+                pupil_radius_norm=pupil_radius,
+                blink=score > _BLINK_THRESHOLD,
+                confidence=max(0.0, 1.0 - score),
+                detector="mediapipe_face_landmarker",
+                gaze_in_head=gaze,
             )
+        )
+
+    head: HeadObservation | None = None
+    if pose is not None:
+        mats = result.facial_transformation_matrixes
+        mat = np.asarray(mats[0], dtype=np.float64) if mats else None
+        head = HeadObservation(
+            t_ns=t_ns,
+            t_uncertainty_ns=t_unc,
+            yaw_deg=pose.yaw_deg,
+            pitch_deg=pose.pitch_deg,
+            roll_deg=pose.roll_deg,
+            face_center_x_norm=float((outer_l.x + outer_r.x) / 2),
+            face_center_y_norm=float((outer_l.y + outer_r.y) / 2),
+            relative_scale=iod,
+            confidence=1.0,
+            transform_4x4=mat if mat is not None and mat.shape == (4, 4) else None,
+            position_cm=pose.position_cm,
+            rotation=pose.rotation,
+            source="webcam",
+        )
 
     return head, eyes
-
-
-def _rotation_to_euler_deg(R: np.ndarray) -> tuple[float, float, float]:
-    """ZYX Euler angles (yaw, pitch, roll) in degrees from a 3×3 rotation matrix."""
-    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
-    if sy > 1e-6:
-        yaw = np.degrees(np.arctan2(R[1, 0], R[0, 0]))
-        pitch = np.degrees(np.arctan2(-R[2, 0], sy))
-        roll = np.degrees(np.arctan2(R[2, 1], R[2, 2]))
-    else:  # gimbal-lock fallback
-        yaw = np.degrees(np.arctan2(-R[1, 2], R[1, 1]))
-        pitch = np.degrees(np.arctan2(-R[2, 0], sy))
-        roll = 0.0
-    return float(yaw), float(pitch), float(roll)

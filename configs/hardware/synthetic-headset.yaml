@@ -1,0 +1,58 @@
+# Simulated headset for debugging the whole path to the cursor before the real one exists:
+# two eye cameras rendering a rotating eyeball, a head camera, and an IMU on the frame.
+# The eyes are puppets: they look at each calibration dot, then wander in saccades, and a
+# pink square in `opengaze run` shows where they really look. `opengaze simulate` scripts
+# them headlessly and reports accuracy against that ground truth.
+# Everything from this profile is labeled SYNTHETIC in the UI and in every CameraFrame.
+hardware_profile:
+  id: synthetic-headset
+  version: 1
+  frame_design: simulated
+
+  cameras:
+    left_eye:
+      source_type: synthetic
+      resolution: [320, 240]
+      fps: 60
+      mounting_position: below_eye
+      options:
+        pattern: eye
+        eye_model: spherical
+        motion: puppet
+        motion_seed: 7
+        noise_seed: 1
+
+    right_eye:
+      source_type: synthetic
+      resolution: [320, 240]
+      fps: 60
+      mounting_position: below_eye
+      options:
+        pattern: eye
+        eye_model: spherical
+        motion: puppet
+        motion_seed: 7
+        noise_seed: 2
+
+    head:
+      source_type: synthetic
+      resolution: [640, 360]
+      fps: 30
+      mounting_position: display_top
+      options:
+        pattern: test_card
+
+  # Held still: the synthetic eyes don't counter-rotate when the head turns, so a moving
+  # simulated head would make the ground truth wrong. (`opengaze simulate` leaves it out.)
+  imu:
+    source_type: synthetic
+    options: {motion: static}
+
+  gaze:
+    pipeline: eye_3d
+    detector_2d: {type: ellipse_fit}
+    eye_model_3d: {type: sphere_fit}
+
+  calibration:
+    screen_mapping: per_user
+    geometry_estimation: geometric

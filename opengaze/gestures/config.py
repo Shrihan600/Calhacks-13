@@ -33,6 +33,14 @@ class BlinkSettings(_Model):
 class WinkSettings(_Model):
     min_wink_ms: float = Field(default=200.0, ge=0.0)
     long_wink_ms: float = Field(default=800.0, gt=0.0)
+    # Winks of the same eye count as one run (double, triple) when the eye closes again
+    # within this long of reopening. The cooldown doesn't apply inside a run.
+    multi_wink_gap_ms: float = Field(default=500.0, gt=0.0)
+    # A held wink presses (hold_wink_* "start") once the eye has been closed this long, so a
+    # twitch never presses the button.
+    hold_press_ms: float = Field(default=300.0, gt=0.0)
+    # During a hold the other eye may close this long (a natural blink) without ending it.
+    hold_blink_tolerance_ms: float = Field(default=350.0, ge=0.0)
     cooldown_ms: float = Field(default=600.0, ge=0.0)
 
     @model_validator(mode="after")
@@ -62,7 +70,8 @@ class GlanceSettings(_Model):
 
 
 MouseAction = Literal[
-    "click",
+    "click",           # repeated winks: double/triple click (see GestureEvent.count)
+    "hold",            # held gestures: left button down at "start", up at "end" (drag)
     "right_click",
     "double_click",
     "middle_click",
@@ -71,7 +80,9 @@ MouseAction = Literal[
     "scroll_left",
     "scroll_right",
 ]
-AppAction = Literal["pause", "toggle_cursor", "recalibrate", "keyboard", "practice", "quit"]
+AppAction = Literal[
+    "pause", "toggle_cursor", "recalibrate", "recenter", "keyboard", "practice", "quit"
+]
 
 
 class Binding(_Model):
@@ -112,3 +123,16 @@ class GestureSettings(_Model):
     bindings: dict[Gesture, Binding] = Field(
         default_factory=lambda: {Gesture.LONG_BLINK: Binding(mouse="click")}
     )
+
+    @field_validator("bindings")
+    @classmethod
+    def _hold_needs_a_held_gesture(cls, value: dict[Gesture, Binding]) -> dict[Gesture, Binding]:
+        # Only held gestures send the "end" that releases the button.
+        held = {Gesture.HOLD_WINK_LEFT, Gesture.HOLD_WINK_RIGHT}
+        for gesture, binding in value.items():
+            if binding.mouse == "hold" and gesture not in held:
+                raise ValueError(
+                    f"{gesture.value}: 'mouse: hold' only works on hold_wink_left / "
+                    "hold_wink_right (other gestures never release the button)"
+                )
+        return value

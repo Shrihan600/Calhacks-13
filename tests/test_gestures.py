@@ -69,20 +69,27 @@ class TestBlinks:
         assert got == [Gesture.LONG_BLINK]
 
 
+_HOLDS = {Gesture.HOLD_WINK_LEFT, Gesture.HOLD_WINK_RIGHT}
+
+
+def no_holds(gestures: list[Gesture]) -> list[Gesture]:
+    return [g for g in gestures if g not in _HOLDS]
+
+
 class TestWinks:
     def test_left_and_right_wink(self):
         left = (0.35, True, False, 0.5, 0.5)
         right = (0.35, False, True, 0.5, 0.5)
-        assert run(GestureRecognizer(), [eyes(0.3, OPEN), left, eyes(0.5, OPEN)]) == [
+        assert no_holds(run(GestureRecognizer(), [eyes(0.3, OPEN), left, eyes(0.5, OPEN)])) == [
             Gesture.WINK_LEFT
         ]
-        assert run(GestureRecognizer(), [eyes(0.3, OPEN), right, eyes(0.5, OPEN)]) == [
+        assert no_holds(run(GestureRecognizer(), [eyes(0.3, OPEN), right, eyes(0.5, OPEN)])) == [
             Gesture.WINK_RIGHT
         ]
 
     def test_long_wink(self):
         frames = [eyes(0.3, OPEN), (1.2, True, False, 0.5, 0.5), eyes(0.5, OPEN)]
-        assert run(GestureRecognizer(), frames) == [Gesture.LONG_WINK_LEFT]
+        assert no_holds(run(GestureRecognizer(), frames)) == [Gesture.LONG_WINK_LEFT]
 
     def test_wink_that_becomes_a_blink_is_not_a_wink(self):
         frames = [
@@ -98,6 +105,77 @@ class TestWinks:
     def test_no_winks_with_one_eye_unobserved(self):
         frames = [(0.3, False, None, 0.5, 0.5), (0.35, True, None, None, None)]
         assert Gesture.WINK_LEFT not in run(GestureRecognizer(), frames)
+
+
+def events(rec: GestureRecognizer, frames: list[tuple]) -> list[GestureEvent]:
+    t = 0.0
+    out: list[GestureEvent] = []
+    for duration, left, right, gx, gy in frames:
+        end = t + duration
+        while t < end - 1e-9:
+            out += rec.update(EyeSignal(t, left, right, gx, gy)).events
+            t += DT
+    return out
+
+
+LEFT_SHUT = (True, False, 0.5, 0.5)
+BOTH_SHUT = (True, True, None, None)
+
+
+class TestWinkRunsAndHolds:
+    def test_quick_winks_count_up_without_waiting(self):
+        wink = [eyes(0.25, LEFT_SHUT), eyes(0.2, OPEN)]
+        got = [e for e in events(GestureRecognizer(), [eyes(0.3, OPEN), *wink * 3])
+               if e.gesture is Gesture.WINK_LEFT]
+        assert [e.count for e in got] == [1, 2, 3]  # the cooldown doesn't block a run
+
+    def test_slow_winks_start_new_runs(self):
+        wink = [eyes(0.25, LEFT_SHUT), eyes(1.0, OPEN)]
+        got = [e for e in events(GestureRecognizer(), [eyes(0.3, OPEN), *wink * 2])
+               if e.gesture is Gesture.WINK_LEFT]
+        assert [e.count for e in got] == [1, 1]
+
+    def test_other_eye_breaks_a_run(self):
+        frames = [eyes(0.3, OPEN), eyes(0.25, LEFT_SHUT), eyes(0.2, OPEN),
+                  eyes(0.25, (False, True, 0.5, 0.5)), eyes(0.2, OPEN),
+                  eyes(0.25, LEFT_SHUT), eyes(1.0, OPEN)]
+        got = [(e.gesture, e.count) for e in events(GestureRecognizer(), frames)
+               if e.gesture in (Gesture.WINK_LEFT, Gesture.WINK_RIGHT)]
+        assert got == [(Gesture.WINK_LEFT, 1), (Gesture.WINK_LEFT, 1)]  # right was in cooldown
+
+    def test_hold_starts_after_press_time_and_ends_on_reopen(self):
+        got = events(GestureRecognizer(), [eyes(0.3, OPEN), eyes(0.6, LEFT_SHUT),
+                                           eyes(0.5, OPEN)])
+        holds = [(e.phase, round(e.t, 2)) for e in got if e.gesture is Gesture.HOLD_WINK_LEFT]
+        assert [p for p, _ in holds] == ["start", "end"]
+        assert holds[0][1] == pytest.approx(0.6, abs=0.04)  # 0.3 s into the wink
+        assert holds[1][1] == pytest.approx(0.9, abs=0.04)
+
+    def test_twitch_never_presses(self):
+        got = events(GestureRecognizer(), [eyes(0.3, OPEN), eyes(0.15, LEFT_SHUT),
+                                           eyes(0.5, OPEN)])
+        assert not any(e.gesture is Gesture.HOLD_WINK_LEFT for e in got)
+
+    def test_natural_blink_during_a_hold_keeps_it_and_isnt_a_double_blink(self):
+        blink = [eyes(0.12, BOTH_SHUT), eyes(0.15, LEFT_SHUT)]
+        frames = [eyes(0.3, OPEN), eyes(0.5, LEFT_SHUT), *blink * 2, eyes(0.4, LEFT_SHUT),
+                  eyes(0.5, OPEN)]
+        got = events(GestureRecognizer(), frames)
+        holds = [e.phase for e in got if e.gesture is Gesture.HOLD_WINK_LEFT]
+        assert holds == ["start", "end"]
+        assert Gesture.DOUBLE_BLINK not in {e.gesture for e in got}
+
+    def test_closing_both_eyes_for_long_ends_the_hold(self):
+        frames = [eyes(0.3, OPEN), eyes(0.5, LEFT_SHUT), eyes(0.6, BOTH_SHUT)]
+        holds = [e.phase for e in events(GestureRecognizer(), frames)
+                 if e.gesture is Gesture.HOLD_WINK_LEFT]
+        assert holds == ["start", "end"]
+
+    def test_losing_an_eye_ends_the_hold(self):
+        frames = [eyes(0.3, OPEN), eyes(0.5, LEFT_SHUT), (0.2, True, None, None, None)]
+        holds = [e.phase for e in events(GestureRecognizer(), frames)
+                 if e.gesture is Gesture.HOLD_WINK_LEFT]
+        assert holds == ["start", "end"]
 
 
 class TestGlances:
@@ -134,8 +212,9 @@ class TestDispatcher:
         def key_combo(self, combo):
             self.calls.append(("key", combo.modifiers, combo.key))
 
-        def mouse(self, action, x, y):
-            self.calls.append(("mouse", action, x, y))
+        def mouse(self, action, x, y, count=1):
+            self.calls.append(("mouse", action, x, y) if count == 1 else
+                              ("mouse", action, x, y, count))
 
     def make(self):
         backend = self.Backend()
@@ -169,6 +248,37 @@ class TestDispatcher:
         d, _, _ = self.make()
         assert d.dispatch(GestureEvent(Gesture.GLANCE_UP, 0.0), None).outcome == "unbound"
 
+    def test_hold_presses_then_releases_even_when_gated(self):
+        backend = self.Backend()
+        d = ActionDispatcher({Gesture.HOLD_WINK_LEFT: Binding(mouse="hold")}, backend)
+        d.system_input_enabled = True
+        d.dispatch(GestureEvent(Gesture.HOLD_WINK_LEFT, 0.0, phase="start"), (5, 6))
+        d.system_input_enabled = False  # e.g. cursor control switched off mid-drag
+        r = d.dispatch(GestureEvent(Gesture.HOLD_WINK_LEFT, 1.0, phase="end"), (50, 60))
+        assert r.outcome == "done"
+        assert backend.calls == [("mouse", "press", 5, 6), ("mouse", "release", 50, 60)]
+
+    def test_hold_end_is_ignored_by_other_bindings(self):
+        backend = self.Backend()
+        d = ActionDispatcher({Gesture.HOLD_WINK_RIGHT: Binding(key="cmd+tab")}, backend)
+        d.system_input_enabled = True
+        d.dispatch(GestureEvent(Gesture.HOLD_WINK_RIGHT, 0.0, phase="start"), (1, 1))
+        r = d.dispatch(GestureEvent(Gesture.HOLD_WINK_RIGHT, 1.0, phase="end"), (1, 1))
+        assert r.outcome == "ignored" and len(backend.calls) == 1
+
+    def test_repeated_clicks_count_and_snap_to_the_first(self):
+        backend = self.Backend()
+        d = ActionDispatcher({Gesture.WINK_RIGHT: Binding(mouse="right_click")}, backend)
+        d.system_input_enabled = True
+        d.dispatch(GestureEvent(Gesture.WINK_RIGHT, 0.0, count=1), (100, 100))
+        d.dispatch(GestureEvent(Gesture.WINK_RIGHT, 0.4, count=2), (120, 110))  # drifted
+        d.dispatch(GestureEvent(Gesture.WINK_RIGHT, 0.8, count=3), (400, 400))  # moved away
+        assert backend.calls == [
+            ("mouse", "right_click", 100, 100),
+            ("mouse", "right_click", 100, 100, 2),
+            ("mouse", "right_click", 400, 400),
+        ]
+
     def test_failing_backend_does_not_raise(self):
         d, backend, _ = self.make()
         d.system_input_enabled = True
@@ -191,6 +301,11 @@ class TestConfig:
             Binding(key="tab", app="pause")
         with pytest.raises(ValidationError):
             Binding(key="cmd+bogus")
+
+    def test_hold_only_on_held_gestures(self):
+        with pytest.raises(ValidationError):
+            GestureSettings.model_validate({"bindings": {"long_blink": {"mouse": "hold"}}})
+        GestureSettings.model_validate({"bindings": {"hold_wink_left": {"mouse": "hold"}}})
 
     def test_unknown_gesture_name_rejected(self):
         with pytest.raises(ValidationError):

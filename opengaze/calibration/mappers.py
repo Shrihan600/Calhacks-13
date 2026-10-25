@@ -1,30 +1,32 @@
-"""Screen mappers for Modes B/C, plus the factory that picks one for a profile.
+"""Screen mappers for every mode, plus the factory that picks one for a profile.
 
-``PolynomialRidgeMapper`` (``geometry_estimation: data_driven``, either eye pipeline)
-    Second-order polynomial of the eye features plus linear head-pose terms, by ridge
-    regression. One sub-model is fitted per usable eye subset (both / left only / right only,
-    each with and without head pose), and prediction uses the richest one the current frame's
-    validity mask supports, so a blink in one eye doesn't wreck the estimate.
+Head pose arrives as two independently valid parts: rotation (webcam or IMU) and position
+(webcam only). Both mappers use whatever the frame has; see ``vision/head_pose.py`` for the
+world and head frames.
 
-``GeometricRayMapper`` (``geometry_estimation: geometric``, ``eye_3d`` pipeline only)
-    Rotates each eye's 3D gaze vector from eye-camera into world coordinates using a fitted
-    camera-to-head rotation and the head pose, then intersects the ray with the screen plane.
-    Head movement is compensated by geometry rather than learned, so it extrapolates to head
-    poses calibration never saw — as long as the head pose signs follow the
-    ``HeadObservation`` contract.
+``PolynomialRidgeMapper`` (``geometry_estimation: data_driven``, any schema)
+    Second-order polynomial of the eye features plus linear head rotation / position terms,
+    by ridge regression. One sub-model is fitted per usable combination of eyes (both / left /
+    right) and head parts (rotation, position), and prediction uses the richest one the
+    current frame supports, so a blink in one eye or a lost head pose doesn't wreck the
+    estimate. Head compensation is learned, so it only covers head movement seen during
+    calibration.
 
-World frame (geometric mapper): x right and y down along the screen, z from the user into
-the screen. The screen is the plane z = 0 with the head camera at the origin; the user's
-eyes are at z = −D.
+``GeometricRayMapper`` (``geometry_estimation: geometric``, gaze-direction schemas)
+    Rotates each eye's gaze direction into the world with a fitted eye-to-head rotation and
+    the measured head rotation, starts the ray at the measured head position, and intersects
+    it with the screen plane z = 0. Head movement is compensated by geometry, so it
+    extrapolates to head poses calibration never saw.
 
-Where the eyes are matters, not just where they point. With a head camera, the face's
-position in its (normalised, mirrored-to-match-the-screen) image gives the eye position
-directly, and the camera's position on the screen (``camera_screen_pos``, default top centre
-as on a MacBook) anchors the plane-to-screen offset, so only the screen scale and the
-eye-camera rotations are fitted. Fitting the offset too would leave a still-head calibration
-unable to tell a screen offset from a slightly wrong eye-camera rotation, and the wrong choice
-only shows up once the head turns. Without a head camera the head can't be compensated
-anyway, so the eye position is fitted as a free offset.
+    With a measured head position, the head camera's position on the screen
+    (``camera_screen_pos``, default top centre as on a MacBook) anchors the plane-to-screen
+    offset and only the screen scale is fitted. Fitting the offset too would leave a
+    still-head calibration unable to tell a screen offset from a slightly wrong eye rotation,
+    and the wrong choice only shows up once the head moves. Without head position (IMU only,
+    or no head sensor) the eyes are assumed to stay put and the offset is fitted.
+
+    Mode A's eye directions come from the iris position within the eye opening through an
+    assumed eyeball size, so a horizontal and vertical gain is fitted on top.
 """
 
 from __future__ import annotations
@@ -37,13 +39,18 @@ from typing import ClassVar
 import numpy as np
 
 from opengaze.calibration.model import GazeModel, ScreenMapper, decode_str
+from opengaze.vision.head_pose import rotation_from_angles
 from opengaze.vision.observations import FEATURE_LAYOUTS, FeatureLayout, SchemaId
 
 _SIDES = ("left", "right")
 # Smallest standard deviation used when z-scoring, per kind of feature, so a feature that
 # barely moved during calibration (typically head pose) can't be amplified into noise.
 _STD_FLOOR_EYE = {"position": 0.01, "direction": 0.01}
-_STD_FLOOR_HEAD = np.array([2.0, 2.0, 2.0, 0.02, 0.02, 0.01])
+_STD_FLOOR_ROT = np.array([2.0, 2.0, 2.0])  # degrees
+_STD_FLOOR_POS = np.array([1.0, 1.0, 2.0])  # cm
+
+# Shared with the rest of the code base; kept under this name for the mapper's callers.
+head_rotation = rotation_from_angles
 
 
 def _eye_inputs(layout: FeatureLayout, x: np.ndarray, side: str) -> np.ndarray:
@@ -52,7 +59,8 @@ def _eye_inputs(layout: FeatureLayout, x: np.ndarray, side: str) -> np.ndarray:
     if layout.eye_kind == "position":
         return vals
     gx, gy, gz = vals
-    return np.array([math.atan2(gx, -gz), math.atan2(gy, -gz)])
+    # Eye cameras see the gaze coming back toward them (z < 0); head-frame gaze has z > 0.
+    return np.array([math.atan2(gx, abs(gz)), math.atan2(gy, abs(gz))])
 
 
 def _valid_mask(x: np.ndarray, valid: np.ndarray | None) -> np.ndarray:
@@ -63,8 +71,12 @@ def _eye_valid(layout: FeatureLayout, valid: np.ndarray, side: str) -> bool:
     return bool(valid[list(layout.eye_values[side])].all())
 
 
-def _head_valid(layout: FeatureLayout, valid: np.ndarray) -> bool:
-    return bool(valid[list(layout.head)].all())
+def _rot_valid(layout: FeatureLayout, valid: np.ndarray) -> bool:
+    return bool(valid[list(layout.head_rot)].all())
+
+
+def _pos_valid(layout: FeatureLayout, valid: np.ndarray) -> bool:
+    return bool(valid[list(layout.head_pos)].all())
 
 
 def _poly2(z: np.ndarray) -> np.ndarray:
@@ -76,6 +88,10 @@ def _poly2(z: np.ndarray) -> np.ndarray:
     return np.hstack(cols)
 
 
+def _key(eyes: tuple[str, ...], rot: bool, pos: bool) -> str:
+    return "+".join(eyes) + ("|rot" if rot else "") + ("|pos" if pos else "")
+
+
 class PolynomialRidgeMapper(ScreenMapper):
     kind: ClassVar[str] = "poly_ridge"
 
@@ -84,8 +100,7 @@ class PolynomialRidgeMapper(ScreenMapper):
         self.alpha = alpha
         self.min_points = min_points
         self.layout = FEATURE_LAYOUTS[schema_id]
-        # key "left+right|head" → arrays
-        self._subs: dict[str, dict[str, np.ndarray]] = {}
+        self._subs: dict[str, dict[str, np.ndarray]] = {}  # _key(...) → arrays
 
     @property
     def fitted(self) -> bool:
@@ -93,17 +108,21 @@ class PolynomialRidgeMapper(ScreenMapper):
 
     # ------------------------------------------------------------------
 
-    def _design(self, rows: np.ndarray, eyes: tuple[str, ...], head: bool) -> np.ndarray:
+    def _design(self, rows: np.ndarray, eyes: tuple[str, ...], rot: bool, pos: bool) -> np.ndarray:
         eye_cols = [np.stack([_eye_inputs(self.layout, r, s) for r in rows]) for s in eyes]
         parts = [np.hstack(eye_cols)]
-        if head:
-            parts.append(rows[:, list(self.layout.head)].astype(np.float64))
+        if rot:
+            parts.append(rows[:, list(self.layout.head_rot)].astype(np.float64))
+        if pos:
+            parts.append(rows[:, list(self.layout.head_pos)].astype(np.float64))
         return np.hstack(parts)
 
-    def _floors(self, eyes: tuple[str, ...], head: bool) -> np.ndarray:
+    def _floors(self, eyes: tuple[str, ...], rot: bool, pos: bool) -> np.ndarray:
         f = [np.full(2 * len(eyes), _STD_FLOOR_EYE[self.layout.eye_kind])]
-        if head:
-            f.append(_STD_FLOOR_HEAD)
+        if rot:
+            f.append(_STD_FLOOR_ROT)
+        if pos:
+            f.append(_STD_FLOOR_POS)
         return np.concatenate(f)
 
     def _expand(self, z: np.ndarray, n_eye: int) -> np.ndarray:
@@ -114,43 +133,47 @@ class PolynomialRidgeMapper(ScreenMapper):
         if X.shape[0] < 2:
             raise ValueError("need at least 2 samples to fit")
         valid = np.ones_like(X, dtype=bool) if valid is None else np.asarray(valid, dtype=bool)
+        rot_rows = np.array([_rot_valid(self.layout, v) for v in valid])
+        pos_rows = np.array([_pos_valid(self.layout, v) for v in valid])
         self._subs = {}
         for n in (2, 1):
             for eyes in combinations(_SIDES, n):
                 eye_rows = np.array(
                     [all(_eye_valid(self.layout, v, s) for s in eyes) for v in valid]
                 )
-                for head in (True, False):
-                    rows = eye_rows & (
-                        np.array([_head_valid(self.layout, v) for v in valid]) if head else True
-                    )
-                    if rows.sum() < self.min_points:
-                        continue
-                    self._fit_sub(X[rows], y[rows], eyes, head)
+                for rot in (True, False):
+                    for pos in (True, False):
+                        rows = eye_rows & (rot_rows if rot else True) & (pos_rows if pos else True)
+                        if rows.sum() >= self.min_points:
+                            self._fit_sub(X[rows], y[rows], eyes, rot, pos)
         if not self._subs:
             raise ValueError(
                 f"no eye had valid features at {self.min_points}+ calibration points"
             )
 
-    def _fit_sub(self, X: np.ndarray, y: np.ndarray, eyes: tuple[str, ...], head: bool) -> None:
-        raw = self._design(X, eyes, head)
+    def _fit_sub(
+        self, X: np.ndarray, y: np.ndarray, eyes: tuple[str, ...], rot: bool, pos: bool
+    ) -> None:
+        raw = self._design(X, eyes, rot, pos)
         mean = raw.mean(axis=0)
-        std = np.maximum(raw.std(axis=0), self._floors(eyes, head))
+        std = np.maximum(raw.std(axis=0), self._floors(eyes, rot, pos))
         phi = self._expand((raw - mean) / std, 2 * len(eyes))
         phi_b = np.hstack([phi, np.ones((phi.shape[0], 1))])
         a = phi_b.T @ phi_b
         a[:-1, :-1] += self.alpha * np.eye(phi.shape[1])
         w = np.linalg.solve(a, phi_b.T @ y.astype(np.float64))
-        self._subs[_key(eyes, head)] = {"mean": mean, "std": std, "w": w}
+        self._subs[_key(eyes, rot, pos)] = {"mean": mean, "std": std, "w": w}
 
-    def _choose(self, valid: np.ndarray) -> tuple[tuple[str, ...], bool] | None:
+    def _choose(self, valid: np.ndarray) -> tuple[tuple[str, ...], bool, bool] | None:
         eyes_ok = tuple(s for s in _SIDES if _eye_valid(self.layout, valid, s))
-        head_ok = _head_valid(self.layout, valid)
+        rot_opts = (True, False) if _rot_valid(self.layout, valid) else (False,)
+        pos_opts = (True, False) if _pos_valid(self.layout, valid) else (False,)
         for n in (2, 1):
             for eyes in combinations(eyes_ok, n):
-                for head in ((True, False) if head_ok else (False,)):
-                    if _key(eyes, head) in self._subs:
-                        return eyes, head
+                for rot in rot_opts:
+                    for pos in pos_opts:
+                        if _key(eyes, rot, pos) in self._subs:
+                            return eyes, rot, pos
         return None
 
     def predict_xy(
@@ -161,23 +184,26 @@ class PolynomialRidgeMapper(ScreenMapper):
         choice = self._choose(_valid_mask(x, valid))
         if choice is None:
             return None
-        eyes, head = choice
-        sub = self._subs[_key(eyes, head)]
-        raw = self._design(x[None, :], eyes, head)
+        eyes, rot, pos = choice
+        sub = self._subs[_key(eyes, rot, pos)]
+        raw = self._design(x[None, :], eyes, rot, pos)
         phi = self._expand((raw - sub["mean"]) / sub["std"], 2 * len(eyes))
         pred = np.hstack([phi, np.ones((1, 1))]) @ sub["w"]
         return float(pred[0, 0]), float(pred[0, 1])
 
     def confidence(self, fv: object) -> float:
-        """Mean confidence of the eyes used, scaled down when head pose is missing."""
-        valid = fv.valid  # type: ignore[attr-defined]
+        """Mean confidence of the eyes used, scaled down when a fitted head part is missing."""
+        values, valid = fv.values, fv.valid  # type: ignore[attr-defined]
         choice = self._choose(valid)
         if choice is None:
             return 0.0
-        eyes, head = choice
-        conf = float(np.mean([fv.values[self.layout.eye_conf[s]] for s in eyes]))  # type: ignore[attr-defined]
-        has_head_model = any(k.endswith("|head") for k in self._subs)
-        return conf * (0.8 if has_head_model and not head else 1.0)
+        eyes, rot, pos = choice
+        conf = float(np.mean([values[self.layout.eye_conf[s]] for s in eyes]))
+        if not rot and any("|rot" in k for k in self._subs):
+            conf *= 0.8
+        if not pos and any("|pos" in k for k in self._subs):
+            conf *= 0.9
+        return conf
 
     # ------------------------------------------------------------------
 
@@ -203,26 +229,9 @@ class PolynomialRidgeMapper(ScreenMapper):
         return m
 
 
-def _key(eyes: tuple[str, ...], head: bool) -> str:
-    return "+".join(eyes) + ("|head" if head else "|nohead")
-
-
 # ---------------------------------------------------------------------------
 # Geometric
 # ---------------------------------------------------------------------------
-
-
-def head_rotation(yaw_deg: float, pitch_deg: float, roll_deg: float) -> np.ndarray:
-    """Head-to-world rotation from ``HeadObservation`` angles, in the world frame above.
-
-    Yaw right turns the forward axis (+z) toward +x, pitch up turns it toward −y (up), and
-    roll right turns the head's up axis (−y) toward +x.
-    """
-    y, p, r = (math.radians(a) for a in (yaw_deg, pitch_deg, roll_deg))
-    ry = np.array([[math.cos(y), 0, math.sin(y)], [0, 1, 0], [-math.sin(y), 0, math.cos(y)]])
-    rx = np.array([[1, 0, 0], [0, math.cos(p), -math.sin(p)], [0, math.sin(p), math.cos(p)]])
-    rz = np.array([[math.cos(r), -math.sin(r), 0], [math.sin(r), math.cos(r), 0], [0, 0, 1]])
-    return ry @ rx @ rz
 
 
 def kabsch(
@@ -303,26 +312,25 @@ class GeometricRayMapper(ScreenMapper):
         schema_id: SchemaId,
         *,
         distance_cm: float = 60.0,
-        head_camera_hfov_deg: float = 60.0,
-        head_camera_aspect: float = 9.0 / 16.0,
         camera_screen_pos: tuple[float, float] = (0.5, 0.0),
         iterations: int = 15,
     ) -> None:
         layout = FEATURE_LAYOUTS[schema_id]
         if layout.eye_kind != "direction":
-            raise ValueError(f"geometric mapping needs 3D gaze vectors; {schema_id} has none")
+            raise ValueError(f"geometric mapping needs gaze directions; {schema_id} has none")
         self.schema_id = schema_id
         self.layout = layout
-        self.distance_cm = distance_cm
-        self.kx = 2.0 * math.tan(math.radians(head_camera_hfov_deg) / 2.0)
-        self.ky = self.kx * head_camera_aspect
+        self.distance_cm = distance_cm  # assumed eye distance when head position is unknown
         self.iterations = iterations
-        self._r_ce: dict[str, np.ndarray] = {}  # eye camera → head, per eye (may be a reflection)
+        self.fit_gain = layout.eye_frame == "head"
+        self._r_ce: dict[str, np.ndarray] = {}  # eye frame → head, per eye (may be a reflection)
         # sx, ox, sy, oy:  screen = s·P + o per axis.
         self._screen = np.array([1.0, camera_screen_pos[0], 1.0, camera_screen_pos[1]])
-        self._head0 = np.zeros(6)  # baseline yaw, pitch, roll, centre x, centre y, scale
-        self._has_head = False
-        self._eye_offset = np.zeros(2)  # fitted eye position (cm) when there is no head pose
+        self._gain = np.ones(2)
+        self._rot0 = np.zeros(3)  # baseline head angles (calibration mean)
+        self._pos0 = np.array([0.0, 0.0, -distance_cm])  # baseline head position
+        self._has_rot = False
+        self._has_pos = False
 
     @property
     def fitted(self) -> bool:
@@ -331,23 +339,22 @@ class GeometricRayMapper(ScreenMapper):
     # ------------------------------------------------------------------
 
     def _head(self, x: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """(R_rel, ray origin) for one row; baseline pose when head pose is missing."""
-        if not self._has_head:
-            return np.eye(3), np.array([*self._eye_offset, -self.distance_cm])
-        h = (
-            x[list(self.layout.head)].astype(np.float64)
-            if _head_valid(self.layout, valid)
-            else self._head0
-        )
-        r_rel = head_rotation(*h[:3]) @ head_rotation(*self._head0[:3]).T
-        scale = h[5] if h[5] > 0 else self._head0[5]
-        d = self.distance_cm * (self._head0[5] / scale if scale > 0 else 1.0)
-        # Face position relative to the head camera's optical axis.
-        origin = np.array([self.kx * d * (h[3] - 0.5), self.ky * d * (h[4] - 0.5), -d])
+        """(rotation relative to the calibration baseline, ray origin) for one row."""
+        r_rel = np.eye(3)
+        if self._has_rot and _rot_valid(self.layout, valid):
+            angles = x[list(self.layout.head_rot)].astype(np.float64)
+            r_rel = rotation_from_angles(*angles) @ rotation_from_angles(*self._rot0).T
+        origin = self._pos0
+        if self._has_pos and _pos_valid(self.layout, valid):
+            origin = x[list(self.layout.head_pos)].astype(np.float64)
         return r_rel, origin
 
-    def _eye_dir(self, x: np.ndarray, side: str) -> np.ndarray:
+    def _eye_dir(self, x: np.ndarray, side: str, gain: np.ndarray | None = None) -> np.ndarray:
         v = x[list(self.layout.eye_values[side])].astype(np.float64)
+        g = self._gain if gain is None else gain
+        if self.fit_gain and abs(v[2]) > 1e-6:
+            t = v[:2] / v[2]
+            v = np.array([g[0] * t[0], g[1] * t[1], 1.0]) * math.copysign(1.0, v[2])
         n = np.linalg.norm(v)
         return v / n if n > 0 else v
 
@@ -370,72 +377,82 @@ class GeometricRayMapper(ScreenMapper):
         sx, ox, sy, oy = self._screen
         return np.array([sx * p[0] + ox, sy * p[1] + oy])
 
+    def _from_screen(self, target: np.ndarray) -> np.ndarray:
+        sx, ox, sy, oy = self._screen
+        return np.array([(target[0] - ox) / sx, (target[1] - oy) / sy])
+
     def fit(self, X: np.ndarray, y: np.ndarray, valid: np.ndarray | None = None) -> None:
         valid = np.ones_like(X, dtype=bool) if valid is None else np.asarray(valid, dtype=bool)
         n = X.shape[0]
         if n < 4:
             raise ValueError("geometric mapping needs at least 4 calibration points")
         y = y.astype(np.float64)
-        head_rows = np.array([_head_valid(self.layout, v) for v in valid])
-        self._has_head = bool(head_rows.any())
-        if self._has_head:
-            self._head0 = X[head_rows][:, list(self.layout.head)].astype(np.float64).mean(axis=0)
-        self._eye_offset = np.zeros(2)
+        rot_rows = np.array([_rot_valid(self.layout, v) for v in valid])
+        pos_rows = np.array([_pos_valid(self.layout, v) for v in valid])
+        self._has_rot, self._has_pos = bool(rot_rows.any()), bool(pos_rows.any())
+        if self._has_rot:
+            self._rot0 = X[rot_rows][:, list(self.layout.head_rot)].astype(np.float64).mean(0)
+        if self._has_pos:
+            self._pos0 = X[pos_rows][:, list(self.layout.head_pos)].astype(np.float64).mean(0)
+        self._gain = np.ones(2)
 
         per_eye = {s: np.array([_eye_valid(self.layout, v, s) for v in valid]) for s in _SIDES}
         per_eye = {s: np.flatnonzero(rows) for s, rows in per_eye.items() if rows.sum() >= 4}
         if not per_eye:
-            raise ValueError("no eye had a valid gaze vector at 4+ calibration points")
-        dirs = {s: np.stack([self._eye_dir(X[i], s) for i in idx]) for s, idx in per_eye.items()}
+            raise ValueError("no eye had a valid gaze direction at 4+ calibration points")
 
         # 1) Initial guess, refined by alternation: the mean gaze direction looks straight at
-        #    the screen (+z); then fit the screen scale (offset too without head pose), then
-        #    the rotation each eye needed to hit every target, and repeat.
+        #    the screen (+z); then fit the screen scale (offset too without head position),
+        #    then the rotation each eye needed to hit every target, and repeat.
         self._r_ce = {}
-        for s in per_eye:
-            mean = dirs[s].mean(axis=0)
+        for s, idx in per_eye.items():
+            mean = np.stack([self._eye_dir(X[i], s) for i in idx]).mean(axis=0)
             self._r_ce[s] = _align(mean / np.linalg.norm(mean), np.array([0.0, 0.0, 1.0]))
         for _ in range(self.iterations):
             self._fit_screen(X, y, valid)
             for s, idx in per_eye.items():
-                b_vecs = []
+                a_vecs, b_vecs = [], []
                 for i in idx:
                     r_rel, origin = self._head(X[i], valid[i])
                     u = np.array([*self._from_screen(y[i]), 0.0]) - origin
+                    a_vecs.append(self._eye_dir(X[i], s))
                     b_vecs.append(r_rel.T @ (u / np.linalg.norm(u)))
-                self._r_ce[s] = kabsch(dirs[s], np.stack(b_vecs), allow_reflection=True)
+                self._r_ce[s] = kabsch(np.stack(a_vecs), np.stack(b_vecs), allow_reflection=True)
 
-        # 2) Joint least-squares refinement of everything, per-eye residuals.
+        # 2) Joint least-squares refinement of everything, with per-eye residuals.
         sides = list(per_eye)
         base = {s: self._r_ce[s].copy() for s in sides}
         heads = [self._head(X[i], valid[i]) for i in range(n)]
-        free_offset = not self._has_head
+        free_offset = not self._has_pos
+        j_screen = 3 * len(sides)
+        j_offset = j_screen + 2
+        j_gain = j_offset + (2 if free_offset else 0)
 
         def unpack(p: np.ndarray) -> None:
             for k, s in enumerate(sides):
                 self._r_ce[s] = base[s] @ _rodrigues(p[3 * k : 3 * k + 3])
-            j = 3 * len(sides)
-            self._screen[0], self._screen[2] = p[j], p[j + 1]
+            self._screen[0], self._screen[2] = p[j_screen], p[j_screen + 1]
             if free_offset:
-                self._eye_offset = p[j + 2 : j + 4]
+                self._screen[1], self._screen[3] = p[j_offset], p[j_offset + 1]
+            if self.fit_gain:
+                self._gain = p[j_gain : j_gain + 2]
 
         def residuals(p: np.ndarray) -> np.ndarray:
             unpack(p)
             res = []
             for s in sides:
-                for row, i in enumerate(per_eye[s]):
-                    r_rel, origin = (
-                        heads[i] if not free_offset else self._head(X[i], valid[i])
-                    )
-                    hit = self._hit(origin, r_rel @ self._r_ce[s] @ dirs[s][row])
+                for i in per_eye[s]:
+                    r_rel, origin = heads[i]
+                    hit = self._hit(origin, r_rel @ self._r_ce[s] @ self._eye_dir(X[i], s))
                     res.append(self._to_screen(hit) - y[i])
             return np.concatenate(res)
 
-        p0 = np.concatenate(
-            [np.zeros(3 * len(sides)), [self._screen[0], self._screen[2]]]
-            + ([self._eye_offset] if free_offset else [])
-        )
-        unpack(_levenberg_marquardt(residuals, p0))
+        p0 = [np.zeros(3 * len(sides)), [self._screen[0], self._screen[2]]]
+        if free_offset:
+            p0.append([self._screen[1], self._screen[3]])
+        if self.fit_gain:
+            p0.append(self._gain)
+        unpack(_levenberg_marquardt(residuals, np.concatenate(p0)))
 
     def _fit_screen(self, X: np.ndarray, y: np.ndarray, valid: np.ndarray) -> None:
         pts = [self._plane_point(X[i], valid[i]) for i in range(X.shape[0])]
@@ -444,7 +461,7 @@ class GeometricRayMapper(ScreenMapper):
         y_arr = y[used]
         for axis in (0, 1):
             px = p_arr[:, axis]
-            if self._has_head:  # offset anchored at the camera's screen position
+            if self._has_pos:  # offset anchored at the camera's screen position
                 o_ = self._screen[2 * axis + 1]
                 denom = float(px @ px)
                 s_ = float(px @ (y_arr[:, axis] - o_)) / denom if denom > 0 else 0.0
@@ -455,10 +472,6 @@ class GeometricRayMapper(ScreenMapper):
             if abs(s_) < 1e-9:
                 raise ValueError("calibration targets don't constrain the screen scale")
             self._screen[2 * axis] = s_
-
-    def _from_screen(self, target: np.ndarray) -> np.ndarray:
-        sx, ox, sy, oy = self._screen
-        return np.array([(target[0] - ox) / sx, (target[1] - oy) / sy])
 
     def predict_xy(
         self, x: np.ndarray, valid: np.ndarray | None = None
@@ -472,16 +485,20 @@ class GeometricRayMapper(ScreenMapper):
         return float(sx), float(sy)
 
     def confidence(self, fv: object) -> float:
-        valid = fv.valid  # type: ignore[attr-defined]
+        values, valid = fv.values, fv.valid  # type: ignore[attr-defined]
         confs = [
-            float(fv.values[self.layout.eye_conf[s]])  # type: ignore[attr-defined]
+            float(values[self.layout.eye_conf[s]])
             for s in self._r_ce
             if _eye_valid(self.layout, valid, s)
         ]
         if not confs:
             return 0.0
-        head_ok = not self._has_head or _head_valid(self.layout, valid)
-        return float(np.mean(confs)) * (1.0 if head_ok else 0.8)
+        conf = float(np.mean(confs))
+        if self._has_rot and not _rot_valid(self.layout, valid):
+            conf *= 0.8
+        if self._has_pos and not _pos_valid(self.layout, valid):
+            conf *= 0.9
+        return conf
 
     # ------------------------------------------------------------------
 
@@ -492,12 +509,12 @@ class GeometricRayMapper(ScreenMapper):
             "mapper_kind": self.kind,
             "schema_id": self.schema_id,
             "distance_cm": np.float64(self.distance_cm),
-            "kx": np.float64(self.kx),
-            "ky": np.float64(self.ky),
             "screen": self._screen,
-            "head0": self._head0,
-            "has_head": np.bool_(self._has_head),
-            "eye_offset": self._eye_offset,
+            "gain": self._gain,
+            "rot0": self._rot0,
+            "pos0": self._pos0,
+            "has_rot": np.bool_(self._has_rot),
+            "has_pos": np.bool_(self._has_pos),
         }
         for s, r in self._r_ce.items():
             out[f"r_ce_{s}"] = r
@@ -506,11 +523,12 @@ class GeometricRayMapper(ScreenMapper):
     @classmethod
     def from_arrays(cls, arrays: dict) -> GeometricRayMapper:
         m = cls(decode_str(arrays["schema_id"]), distance_cm=float(arrays["distance_cm"]))  # type: ignore[arg-type]
-        m.kx, m.ky = float(arrays["kx"]), float(arrays["ky"])
         m._screen = np.asarray(arrays["screen"], dtype=np.float64)
-        m._head0 = np.asarray(arrays["head0"], dtype=np.float64)
-        m._has_head = bool(arrays["has_head"])
-        m._eye_offset = np.asarray(arrays["eye_offset"], dtype=np.float64)
+        m._gain = np.asarray(arrays["gain"], dtype=np.float64)
+        m._rot0 = np.asarray(arrays["rot0"], dtype=np.float64)
+        m._pos0 = np.asarray(arrays["pos0"], dtype=np.float64)
+        m._has_rot = bool(arrays["has_rot"])
+        m._has_pos = bool(arrays["has_pos"])
         m._r_ce = {s: np.asarray(arrays[f"r_ce_{s}"]) for s in _SIDES if f"r_ce_{s}" in arrays}
         return m
 
@@ -527,8 +545,6 @@ MAPPERS: dict[str, type[ScreenMapper]] = {
 
 
 def mapper_kind_for(schema_id: str, geometry_estimation: str = "data_driven") -> str:
-    if schema_id == "A-webcam":
-        return GazeModel.kind
     if geometry_estimation == "geometric":
         return GeometricRayMapper.kind
     return PolynomialRidgeMapper.kind

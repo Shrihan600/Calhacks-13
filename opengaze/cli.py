@@ -199,8 +199,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     except ImportError as exc:
         print(f"desktop UI unavailable ({exc}); install with: pip install -e '.[desktop]'")
         return 1
+    if args.record_video and not config.privacy.allow_recording:
+        print("--record-video saves eye-camera video (biometric data). Set "
+              "privacy.allow_recording: true in the app config to allow it.")
+        return 1
     ensure_camera_permission(report)
-    return run_gaze_test(report, config)
+    return run_gaze_test(
+        report, config, adaptive=args.adaptive, trace=args.trace, record_video=args.record_video
+    )
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
@@ -209,12 +215,152 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         _print_report(report)
         return 1
     try:
-        from opengaze.desktop.calibration_ui import run_calibration
+        if args.adaptive:
+            from opengaze.desktop.adaptive_calibration_ui import (
+                run_adaptive_calibration as run_calibration,
+            )
+        else:
+            from opengaze.desktop.calibration_ui import run_calibration
     except ImportError as exc:
         print(f"desktop UI unavailable ({exc}); install with: pip install -e '.[desktop]'")
         return 1
     ensure_camera_permission(report)
     return run_calibration(report, config)
+
+
+def cmd_calibration_log(args: argparse.Namespace) -> int:
+    """Summarise an adaptive calibration log and replay how many points it needed."""
+    from opengaze.calibration.adaptive import AdaptiveLog, list_logs, points_needed_curve
+
+    configure_logging(args.log_level or "WARNING")
+    if args.path:
+        path = Path(args.path)
+    else:
+        logs = list_logs()
+        if not logs:
+            print("No adaptive calibration logs yet — run `opengaze calibrate --adaptive`.")
+            return 1
+        path = logs[-1]
+    run = AdaptiveLog.load(path)
+    print(f"log:      {path}")
+    print(f"schema:   {run.schema_id} ({run.geometry_estimation}), settings {run.settings}")
+    print(f"summary:  {run.summary()}")
+    print()
+    print(f"{'#':>3} {'target':>13} {'phase':5} {'action':6} {'error':>7} {'px':>6} "
+          f"{'samples':>7} {'conf':>5} {'train':>5}")
+    for r in run.records:
+        err = f"{r.error_norm:7.3f}" if r.error_norm is not None else "      —"
+        px = f"{r.error_px:6.0f}" if r.error_px is not None else "     —"
+        print(f"{r.index:3} ({r.target_x:.2f}, {r.target_y:.2f}) {r.phase:5} {r.action:6} "
+              f"{err} {px} {r.n_samples:7} {r.mean_confidence:5.2f} {r.n_training_after:5}")
+    curve = points_needed_curve(run)
+    if curve:
+        print()
+        print("Replay: fit on the first k points shown, test on the rest")
+        print(f"{'k':>3} {'mean':>7} {'max':>7} {'mean px':>8} {'tested':>6}")
+        for c in curve:
+            px = f"{c.mean_error_px:8.0f}" if c.mean_error_px is not None else "       —"
+            print(f"{c.n_training:3} {c.mean_error_norm:7.3f} {c.max_error_norm:7.3f} "
+                  f"{px} {c.n_eval:6}")
+    return 0
+
+
+def cmd_simulate(args: argparse.Namespace) -> int:
+    """Calibrate a simulated user and drive the cursor headlessly; report every stage."""
+    from opengaze.debug.harness import SimulatedUser, simulate
+
+    if not args.profile:
+        args.profile = str(REPO_ROOT / "configs" / "hardware" / "synthetic-headset.yaml")
+    config, report = _load(args)
+    if not report.ok:
+        _print_report(report)
+        return 1
+    assert report.profile is not None
+    user = SimulatedUser(reaction_s=args.reaction, jitter_norm=args.jitter, seed=args.seed)
+    result = simulate(
+        report.profile, config, adaptive=args.adaptive, fixations=args.fixations,
+        user=user, seed=args.seed, progress=lambda m: print(f"… {m}"),
+        record=Path(args.record).expanduser() if args.record else None,
+    )
+    print()
+    print(result.report.format())
+    print(f"\ntrace: {result.trace_path}")
+    if args.record:
+        print(f"session: {args.record}  (opengaze replay {args.record})")
+    return 1 if any(s.status == "fail" for s in result.report.stages) else 0
+
+
+def _latest_trace() -> Path | None:
+    from opengaze.debug.harness import SESSION_DIR
+    from opengaze.debug.trace import list_traces
+
+    found = list_traces() + list_traces(SESSION_DIR)
+    return max(found, key=lambda p: p.stat().st_mtime) if found else None
+
+
+def cmd_trace_report(args: argparse.Namespace) -> int:
+    """Stage-by-stage report of a trace: where does the path to the cursor break?"""
+    from opengaze.debug.analyze import analyze
+    from opengaze.debug.trace import load_trace
+
+    configure_logging(args.log_level or "WARNING")
+    path = Path(args.path) if args.path else _latest_trace()
+    if path is None:
+        print("No traces yet — record one with `opengaze run --trace` (or T in the run window).")
+        return 1
+    if path.is_dir():  # a recorded session
+        runs = sorted(path.glob("run-*.trace.jsonl"))
+        if not runs:
+            print(f"no run trace in {path}")
+            return 1
+        path = runs[0]
+    trace = load_trace(path)
+    h = trace.header
+    print(f"trace:   {path}")
+    print(f"profile: {h.get('profile_id')} ({h.get('schema')}, {h.get('estimation')})"
+          f"{'  SIMULATED' if h.get('simulated') else ''}")
+    if trace.events:
+        t0 = trace.ticks[0]["t"] if trace.ticks else 0.0
+        print("events:  " + ", ".join(f"{e['t'] - t0:.1f}s {e['msg']}" for e in trace.events))
+    print()
+    if not trace.ticks:
+        print("No ticks recorded.")
+        return 1
+    print(analyze(trace.ticks, h).format())
+    return 0
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Re-run a recorded session through the current code and compare with the original."""
+    from opengaze.debug.harness import replay
+
+    config = load_app_config(args.config)
+    configure_logging(args.log_level or "WARNING")
+    session = Path(args.session).expanduser()
+    if not (session / "profile.yaml").exists():
+        print(f"{session} is not a recorded session (no profile.yaml)")
+        return 1
+    result = replay(session, config)
+    if result.original is not None:
+        print("ORIGINAL (live)")
+        print(result.original.format())
+        print()
+    print("REPLAY (current code)")
+    print(result.report.format())
+    print(f"\ntrace: {result.trace_path}")
+    return 0
+
+
+def cmd_cursor_test(args: argparse.Namespace) -> int:
+    """Check Accessibility, the displays, and that posted cursor moves land."""
+    from opengaze.debug.cursor_test import run_cursor_test
+
+    configure_logging(args.log_level or "WARNING")
+    if not args.no_move:
+        print("Moving the cursor to the centre and corners of each display…")
+    result = run_cursor_test(move=not args.no_move, say=print if args.verbose else None)
+    print(result.format())
+    return 0 if result.ok else 1
 
 
 def cmd_calibration_info(args: argparse.Namespace) -> int:
@@ -254,7 +400,40 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("run", help="open gaze test environment (auto-calibrates if needed)")
     add_profile_args(p)
+    p.add_argument("--adaptive", action="store_true", help="auto-calibrate adaptively")
+    p.add_argument("--trace", action="store_true",
+                   help="record a per-tick pipeline trace (`opengaze trace-report`)")
+    p.add_argument("--record-video", action="store_true",
+                   help="also save camera video for `opengaze replay` "
+                        "(needs privacy.allow_recording)")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("simulate",
+                       help="calibrate a simulated user and drive the cursor headlessly")
+    add_profile_args(p)
+    p.add_argument("--adaptive", action="store_true", help="calibrate adaptively")
+    p.add_argument("--fixations", type=int, default=16, help="test fixations after calibrating")
+    p.add_argument("--jitter", type=float, default=0.004,
+                   help="fixation jitter, fraction of the screen (default 0.004)")
+    p.add_argument("--reaction", type=float, default=0.2, help="saccade latency, s")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--record", metavar="DIR",
+                   help="also save the test phase as a session in DIR (try `opengaze replay`)")
+    p.set_defaults(func=cmd_simulate)
+
+    p = sub.add_parser("trace-report", help="stage-by-stage report of a pipeline trace")
+    p.add_argument("path", nargs="?", help="trace or session folder (default: the most recent)")
+    p.set_defaults(func=cmd_trace_report)
+
+    p = sub.add_parser("replay", help="re-run a recorded session through the current code")
+    p.add_argument("session", help="session folder from `opengaze run --record-video`")
+    p.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="app config YAML")
+    p.set_defaults(func=cmd_replay)
+
+    p = sub.add_parser("cursor-test", help="check that the macOS cursor can be driven")
+    p.add_argument("--no-move", action="store_true", help="only check permission and displays")
+    p.add_argument("-v", "--verbose", action="store_true", help="print every move")
+    p.set_defaults(func=cmd_cursor_test)
 
     p = sub.add_parser("diagnostics", help="live camera previews and health (PySide6)")
     add_profile_args(p)
@@ -282,7 +461,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("calibrate", help="run the 9-point gaze calibration wizard (PySide6)")
     add_profile_args(p)
+    p.add_argument(
+        "--adaptive",
+        action="store_true",
+        help="stream dots that test the model and train it where it's wrong, until accurate",
+    )
     p.set_defaults(func=cmd_calibrate)
+
+    p = sub.add_parser(
+        "calibration-log", help="show an adaptive calibration log and its points-needed replay"
+    )
+    p.add_argument("path", nargs="?", help="log file (default: the most recent)")
+    p.set_defaults(func=cmd_calibration_log)
 
     p = sub.add_parser("calibration-info", help="show stored calibration status for this profile")
     add_profile_args(p)

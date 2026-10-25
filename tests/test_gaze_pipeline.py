@@ -16,7 +16,6 @@ from opengaze.calibration.mappers import (
     make_mapper,
     mapper_from_arrays,
 )
-from opengaze.calibration.model import GazeModel
 from opengaze.calibration.session import GRID_9, CalibrationSession
 from opengaze.calibration.storage import CalibrationStore
 from opengaze.calibration.validation import validate_calibration
@@ -294,80 +293,113 @@ def test_schema_for():
 # ---------------------------------------------------------------------------
 
 SCREEN_W_CM, SCREEN_H_CM = 34.0, 22.0
+HEAD0 = (0.0, 0.0, 0.0, 0.0, 12.0, -60.0)  # facing the screen, 12 cm below the camera
 
 
-def _true_r_ce(seed: int) -> np.ndarray:
+def _true_r_ce(seed: int, schema: str) -> np.ndarray:
+    if FEATURE_LAYOUTS[schema].eye_frame == "head":
+        return head_rotation(2.0 * seed, -3.0, 0.0)  # webcam: eye-in-head ≈ head frame
     # Eye camera below the eye, tilted up at it, plus a little arbitrary roll.
     return head_rotation(5 * seed, -25.0, 10.0 - 5 * seed) @ np.diag([1.0, -1.0, -1.0])
 
 
-def synthetic_3d_rows(targets, heads, mapper: GeometricRayMapper):
-    """Feature rows generated with the geometric model's own conventions."""
-    layout = FEATURE_LAYOUTS["C-eye3d"]
-    head0 = np.array([0.0, 0.0, 0.0, 0.5, 0.5, 0.15])
-    rows = []
+def synthetic_rows(targets, heads, schema="C-eye3d", *, position=True, gain=(1.0, 1.0)):
+    """Feature rows from a known geometry (head pose = yaw, pitch, roll, x, y, z cm).
+
+    ``gain`` distorts head-frame eye directions the way an unknown eyeball size would.
+    """
+    layout = FEATURE_LAYOUTS[schema]
+    rows, valids = [], []
     for (x, y), h in zip(targets, heads, strict=True):
         h = np.asarray(h, dtype=np.float64)
-        d = 60.0 * head0[5] / h[5]
-        origin = np.array(
-            [mapper.kx * d * (h[3] - head0[3]), mapper.ky * d * (h[4] - head0[4]), -d]
-        )
         target = np.array([(x - 0.5) * SCREEN_W_CM, y * SCREEN_H_CM + 1.0, 0.0])
-        u = target - origin
+        u = target - h[3:]
         u /= np.linalg.norm(u)
         row = np.zeros(layout.width, dtype=np.float32)
+        valid = np.ones(layout.width, dtype=bool)
         for i, side in enumerate(("left", "right")):
-            v = (head_rotation(*h[:3]) @ _true_r_ce(i)).T @ u
+            v = (head_rotation(*h[:3]) @ _true_r_ce(i, schema)).T @ u
+            if layout.eye_frame == "head":
+                t = v[:2] / v[2] / np.asarray(gain)
+                v = np.array([*t, 1.0]) / np.linalg.norm([*t, 1.0])
             row[list(layout.eye_values[side])] = v
             row[layout.eye_conf[side]] = 1.0
         row[list(layout.head)] = h
+        if not position:
+            valid[list(layout.head_pos)] = False
         rows.append(row)
-    return np.stack(rows)
+        valids.append(valid)
+    return np.stack(rows), np.stack(valids)
 
 
-def test_geometric_mapper_compensates_unseen_head_poses():
+def _still_heads(rng, n):
+    return [
+        (*rng.normal(0, 1.0, 3), *(np.array(HEAD0[3:]) + rng.normal(0, 0.3, 3))) for _ in range(n)
+    ]
+
+
+def _moved_heads(rng, n, *, translate=True):
+    shift = (lambda: rng.uniform(-6, 6, 3)) if translate else (lambda: np.zeros(3))
+    return [(*rng.uniform(-12, 12, 3), *(np.array(HEAD0[3:]) + shift())) for _ in range(n)]
+
+
+def _errors(mapper, X, valid, targets):
+    rows = zip(X, valid, targets, strict=True)
+    return [math.dist(mapper.predict_xy(x, v), t) for x, v, t in rows]
+
+
+@pytest.mark.parametrize("schema", ["C-eye3d", "A-webcam"])
+def test_geometric_mapper_compensates_unseen_head_poses(schema):
     rng = np.random.default_rng(3)
-    mapper = GeometricRayMapper("C-eye3d")
     targets = np.array(GRID_9, dtype=np.float32)
-    # Calibration: head nearly still.
-    cal_heads = [
-        (*rng.normal(0, 1.0, 3), 0.5 + rng.normal(0, 0.005), 0.5 + rng.normal(0, 0.005), 0.15)
-        for _ in targets
-    ]
-    X = synthetic_3d_rows(targets, cal_heads, mapper)
-    mapper.fit(X, targets)
+    gain = (1.25, 0.8) if schema == "A-webcam" else (1.0, 1.0)
+    X, valid = synthetic_rows(targets, _still_heads(rng, 9), schema, gain=gain)
+    geometric = GeometricRayMapper(schema)
+    geometric.fit(X, targets, valid)
+    data_driven = PolynomialRidgeMapper(schema)
+    data_driven.fit(X, targets, valid)
 
-    data_driven = PolynomialRidgeMapper("C-eye3d")
-    data_driven.fit(X, targets)
-
-    # Test: head turned/tilted well beyond anything seen during calibration.
+    # Head turned/tilted and moved well beyond anything seen during calibration.
     test_targets = rng.uniform(0.1, 0.9, (30, 2))
-    test_heads = [
-        (*rng.uniform(-12, 12, 3), 0.5 + rng.uniform(-0.05, 0.05), 0.5, 0.15) for _ in test_targets
-    ]
-    Xt = synthetic_3d_rows(test_targets, test_heads, mapper)
-    geo_err = [math.dist(mapper.predict_xy(x), t) for x, t in zip(Xt, test_targets, strict=True)]
-    dd_err = [
-        math.dist(data_driven.predict_xy(x), t) for x, t in zip(Xt, test_targets, strict=True)
-    ]
+    Xt, vt = synthetic_rows(test_targets, _moved_heads(rng, 30), schema, gain=gain)
+    geo_err = _errors(geometric, Xt, vt, test_targets)
+    dd_err = _errors(data_driven, Xt, vt, test_targets)
     assert np.median(geo_err) < 0.02
     assert np.median(geo_err) < np.median(dd_err) / 3
 
 
-def test_geometric_mapper_uses_remaining_eye():
-    mapper = GeometricRayMapper("C-eye3d")
+def test_geometric_mapper_with_imu_rotation_only():
+    """Modes B/C with an IMU and no head camera: rotation known, position not."""
+    rng = np.random.default_rng(4)
     targets = np.array(GRID_9, dtype=np.float32)
-    heads = [(0, 0, 0, 0.5, 0.5, 0.15)] * len(targets)
-    X = synthetic_3d_rows(targets, heads, mapper)
-    mapper.fit(X, targets)
+    X, valid = synthetic_rows(targets, _still_heads(rng, 9), position=False)
+    mapper = GeometricRayMapper("C-eye3d")
+    mapper.fit(X, targets, valid)
+    test_targets = rng.uniform(0.1, 0.9, (30, 2))
+    heads = _moved_heads(rng, 30, translate=False)
+    Xt, vt = synthetic_rows(test_targets, heads, position=False)
+    # Without head position the screen offset is fitted, which leaves a weak ambiguity with
+    # the eye-camera rotation: still far better than learned compensation, not as exact as
+    # with a head camera (see the test above).
+    data_driven = PolynomialRidgeMapper("C-eye3d")
+    data_driven.fit(X, targets, valid)
+    geo = np.median(_errors(mapper, Xt, vt, test_targets))
+    assert geo < 0.04
+    assert geo < np.median(_errors(data_driven, Xt, vt, test_targets)) / 2
+
+
+def test_geometric_mapper_uses_remaining_eye():
+    targets = np.array(GRID_9, dtype=np.float32)
+    X, valid = synthetic_rows(targets, [HEAD0] * len(targets))
+    mapper = GeometricRayMapper("C-eye3d")
+    mapper.fit(X, targets, valid)
     layout = FEATURE_LAYOUTS["C-eye3d"]
-    valid = np.ones(layout.width, dtype=bool)
-    valid[list(layout.eye_values["left"])] = False
-    x, y = mapper.predict_xy(X[4], valid)
-    assert math.dist((x, y), targets[4]) < 0.01
+    one_eye = valid[4].copy()
+    one_eye[list(layout.eye_values["left"])] = False
+    assert math.dist(mapper.predict_xy(X[4], one_eye), targets[4]) < 0.01
 
 
-def test_poly_mapper_falls_back_to_one_eye():
+def test_poly_mapper_falls_back_to_one_eye_and_no_head():
     layout = FEATURE_LAYOUTS["C-pupil2d"]
     rng = np.random.default_rng(0)
     targets = rng.uniform(0, 1, (15, 2))
@@ -375,14 +407,15 @@ def test_poly_mapper_falls_back_to_one_eye():
     X[:, 0:2] = 0.3 + 0.4 * targets  # left pupil
     X[:, 3:5] = 0.35 + 0.4 * targets  # right pupil
     X[:, [2, 5]] = 1.0
+    X[:, list(layout.head)] = HEAD0
     mapper = PolynomialRidgeMapper("C-pupil2d", alpha=1e-4)
     valid = np.ones_like(X, dtype=bool)
-    valid[:, 6:] = False  # no head camera
     mapper.fit(X, targets, valid)
-    one_eye = valid[0].copy()
-    one_eye[0:3] = False
+    one_eye_no_head = valid[0].copy()
+    one_eye_no_head[0:3] = False
+    one_eye_no_head[list(layout.head)] = False
     for x, t in zip(X, targets, strict=True):
-        assert math.dist(mapper.predict_xy(x, one_eye), t) < 0.01
+        assert math.dist(mapper.predict_xy(x, one_eye_no_head), t) < 0.01
     none = np.zeros(layout.width, dtype=bool)
     assert mapper.predict_xy(X[0], none) is None
     fv = FeatureVector(0, X[0], none, "C-pupil2d", 0, None, None, None)
@@ -393,8 +426,8 @@ def test_poly_mapper_falls_back_to_one_eye():
 def test_mapper_arrays_round_trip(cls):
     mapper = cls("C-eye3d")
     targets = np.array(GRID_9, dtype=np.float32)
-    X = synthetic_3d_rows(targets, [(0, 0, 0, 0.5, 0.5, 0.15)] * 9, GeometricRayMapper("C-eye3d"))
-    mapper.fit(X, targets)
+    X, valid = synthetic_rows(targets, _still_heads(np.random.default_rng(1), 9))
+    mapper.fit(X, targets, valid)
     arrays = {k: (np.bytes_(v) if isinstance(v, str) else v) for k, v in mapper.to_arrays().items()}
     loaded = mapper_from_arrays(arrays)
     assert type(loaded) is cls
@@ -403,12 +436,13 @@ def test_mapper_arrays_round_trip(cls):
 
 
 def test_geometric_needs_direction_schema():
-    with pytest.raises(ValueError, match="3D gaze vectors"):
+    with pytest.raises(ValueError, match="gaze directions"):
         GeometricRayMapper("C-pupil2d")
 
 
 def test_make_mapper_kinds():
-    assert isinstance(make_mapper("A-webcam", "data_driven"), GazeModel)
+    assert isinstance(make_mapper("A-webcam", "data_driven"), PolynomialRidgeMapper)
+    assert isinstance(make_mapper("A-webcam", "geometric"), GeometricRayMapper)
     assert isinstance(make_mapper("B-pupil2d"), PolynomialRidgeMapper)
     assert isinstance(make_mapper("C-eye3d", "geometric"), GeometricRayMapper)
 
@@ -447,7 +481,8 @@ def test_store_rejects_changed_tracking_settings(tmp_path):
     profile = eye_profile("eye_3d", "geometric")
     targets = np.array(GRID_9, dtype=np.float32)
     mapper = GeometricRayMapper("C-eye3d")
-    mapper.fit(synthetic_3d_rows(targets, [(0, 0, 0, 0.5, 0.5, 0.15)] * 9, mapper), targets)
+    X, valid = synthetic_rows(targets, [HEAD0] * 9)
+    mapper.fit(X, targets, valid)
     store = CalibrationStore(tmp_path)
     store.save(mapper, profile)
 

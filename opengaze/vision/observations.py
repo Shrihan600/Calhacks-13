@@ -17,7 +17,7 @@ class EyeObservation:
     """Pupil / iris features for one eye extracted from one frame."""
 
     camera_id: str
-    eye: Literal["left", "right"]
+    eye: Literal["left", "right"]  # the user's left / right eye
     t_ns: int
     t_uncertainty_ns: int | None
     # Normalised to [0, 1] within the normalised camera image.
@@ -27,14 +27,17 @@ class EyeObservation:
     blink: bool
     confidence: float  # 0 … 1
     detector: str  # e.g. "mediapipe_face_landmarker"
+    # Webcam only: unit gaze direction in the head frame (see vision/head_pose.py), from the
+    # iris position within the eye opening, so it doesn't move when the head does.
+    gaze_in_head: tuple[float, float, float] | None = None
 
 
 @dataclass(frozen=True, slots=True, eq=False)
 class HeadObservation:
-    """Head pose and face-centre position in one frame.
+    """Head rotation and position in the world frame (see ``vision/head_pose.py``).
 
-    ``eq=False``: the optional ``transform_4x4`` numpy array cannot be compared
-    element-wise with ``==`` without raising an ambiguity error.
+    ``eq=False``: the numpy arrays cannot be compared element-wise with ``==`` without
+    raising an ambiguity error.
     """
 
     t_ns: int
@@ -42,49 +45,28 @@ class HeadObservation:
     yaw_deg: float    # positive = turning right
     pitch_deg: float  # positive = looking up
     roll_deg: float   # positive = tilting right
-    face_center_x_norm: float  # midpoint between irises, normalised [0, 1]
+    face_center_x_norm: float  # midpoint between the eyes in the head image, [0, 1]
     face_center_y_norm: float
-    relative_scale: float  # inter-ocular distance / reference; 1.0 at calibration distance
+    relative_scale: float  # eye-corner span in the head image, fraction of image width
     confidence: float  # 0 … 1
     transform_4x4: np.ndarray | None  # 4×4 head-to-camera transform from MediaPipe, if available
+    # Head position (eye midpoint) in cm, world frame; None when unknown (e.g. IMU only).
+    position_cm: tuple[float, float, float] | None = None
+    rotation: np.ndarray | None = None  # 3×3 head → world, consistent with the angles
+    source: Literal["webcam", "imu", "imu+webcam"] = "webcam"
 
 
-# Canonical order for Mode A. Calibration models are trained to this fixed layout.
+HEAD_FEATURE_NAMES: tuple[str, ...] = (
+    "head_yaw",
+    "head_pitch",
+    "head_roll",
+    "head_x_cm",
+    "head_y_cm",
+    "head_z_cm",
+)
+
+# Mode A: eye-in-head gaze direction per eye (from iris within the eye opening) + head pose.
 FEATURE_NAMES_MODE_A: tuple[str, ...] = (
-    "left_pupil_x",
-    "left_pupil_y",
-    "left_pupil_conf",
-    "right_pupil_x",
-    "right_pupil_y",
-    "right_pupil_conf",
-    "head_yaw",
-    "head_pitch",
-    "head_roll",
-    "head_center_x",
-    "head_center_y",
-    "head_scale",
-)
-
-
-# One schema per mode × eye pipeline. A calibration is fitted for exactly one of these.
-SchemaId = Literal["A-webcam", "B-pupil2d", "C-pupil2d", "B-eye3d", "C-eye3d"]
-SCHEMA_IDS: tuple[str, ...] = get_args(SchemaId)
-
-_HEAD_NAMES = (
-    "head_yaw",
-    "head_pitch",
-    "head_roll",
-    "head_center_x",
-    "head_center_y",
-    "head_scale",
-)
-
-# Modes B/C, 2D pupil pipeline: pupil centre in the normalised eye-camera image. Same layout
-# as Mode A, but the pupil coordinates come from a different image, so models never transfer.
-FEATURE_NAMES_PUPIL_2D: tuple[str, ...] = FEATURE_NAMES_MODE_A
-
-# Modes B/C, 3D eye-model pipeline: unit gaze vector in eye-camera coordinates.
-FEATURE_NAMES_EYE_3D: tuple[str, ...] = (
     "left_gaze_x",
     "left_gaze_y",
     "left_gaze_z",
@@ -93,8 +75,28 @@ FEATURE_NAMES_EYE_3D: tuple[str, ...] = (
     "right_gaze_y",
     "right_gaze_z",
     "right_gaze_conf",
-    *_HEAD_NAMES,
+    *HEAD_FEATURE_NAMES,
 )
+
+# Modes B/C, 2D pupil pipeline: pupil centre in the normalised eye-camera image.
+FEATURE_NAMES_PUPIL_2D: tuple[str, ...] = (
+    "left_pupil_x",
+    "left_pupil_y",
+    "left_pupil_conf",
+    "right_pupil_x",
+    "right_pupil_y",
+    "right_pupil_conf",
+    *HEAD_FEATURE_NAMES,
+)
+
+# Modes B/C, 3D eye-model pipeline: unit gaze vector in eye-camera coordinates.
+FEATURE_NAMES_EYE_3D: tuple[str, ...] = FEATURE_NAMES_MODE_A
+
+# One schema per mode × eye pipeline. A calibration is fitted for exactly one of these.
+SchemaId = Literal["A-webcam", "B-pupil2d", "C-pupil2d", "B-eye3d", "C-eye3d"]
+SCHEMA_IDS: tuple[str, ...] = get_args(SchemaId)
+# Bump when any layout or the meaning of a feature changes; stored calibrations are tied to it.
+FEATURE_LAYOUT_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,36 +106,56 @@ class FeatureLayout:
     names: tuple[str, ...]
     eye_values: dict[str, tuple[int, ...]]  # "left"/"right" -> value columns (no confidence)
     eye_conf: dict[str, int]
-    head: tuple[int, ...]  # yaw, pitch, roll, center x, center y, scale
+    head_rot: tuple[int, ...]  # yaw, pitch, roll (degrees)
+    head_pos: tuple[int, ...]  # x, y, z (cm, world frame)
     eye_kind: Literal["position", "direction"]
+    # Frame the eye directions are in: the eye camera's, or the head's (webcam, Mode A).
+    eye_frame: Literal["image", "eye_camera", "head"]
 
     @property
     def width(self) -> int:
         return len(self.names)
 
+    @property
+    def head(self) -> tuple[int, ...]:
+        return self.head_rot + self.head_pos
 
-_LAYOUT_2D = FeatureLayout(
-    names=FEATURE_NAMES_PUPIL_2D,
-    eye_values={"left": (0, 1), "right": (3, 4)},
-    eye_conf={"left": 2, "right": 5},
-    head=tuple(range(6, 12)),
-    eye_kind="position",
-)
-_LAYOUT_3D = FeatureLayout(
-    names=FEATURE_NAMES_EYE_3D,
-    eye_values={"left": (0, 1, 2), "right": (4, 5, 6)},
-    eye_conf={"left": 3, "right": 7},
-    head=tuple(range(8, 14)),
-    eye_kind="direction",
-)
+
+def _layout(names, kind, frame) -> FeatureLayout:
+    per_eye = 2 if kind == "position" else 3
+    stride = per_eye + 1
+    return FeatureLayout(
+        names=names,
+        eye_values={
+            "left": tuple(range(per_eye)),
+            "right": tuple(range(stride, stride + per_eye)),
+        },
+        eye_conf={"left": per_eye, "right": stride + per_eye},
+        head_rot=tuple(range(2 * stride, 2 * stride + 3)),
+        head_pos=tuple(range(2 * stride + 3, 2 * stride + 6)),
+        eye_kind=kind,
+        eye_frame=frame,
+    )
+
+
+_LAYOUT_2D = _layout(FEATURE_NAMES_PUPIL_2D, "position", "image")
+_LAYOUT_3D = _layout(FEATURE_NAMES_EYE_3D, "direction", "eye_camera")
 
 FEATURE_LAYOUTS: dict[str, FeatureLayout] = {
-    "A-webcam": _LAYOUT_2D,
+    "A-webcam": _layout(FEATURE_NAMES_MODE_A, "direction", "head"),
     "B-pupil2d": _LAYOUT_2D,
     "C-pupil2d": _LAYOUT_2D,
     "B-eye3d": _LAYOUT_3D,
     "C-eye3d": _LAYOUT_3D,
 }
+
+
+def head_values(head: HeadObservation) -> tuple[tuple[float, ...], bool, tuple[float, ...], bool]:
+    """(rotation values, rotation valid, position values, position valid) for feature slots."""
+    rot = (head.yaw_deg, head.pitch_deg, head.roll_deg)
+    if head.position_cm is None:
+        return rot, True, (0.0, 0.0, 0.0), False
+    return rot, True, tuple(head.position_cm), True
 
 
 @dataclass(frozen=True, slots=True, eq=False)

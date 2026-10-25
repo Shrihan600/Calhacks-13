@@ -24,6 +24,10 @@ class GestureRecognizer:
 
     With a single eye camera (Mode B) the unobserved eye is reported as None; for blink
     purposes it is assumed to mirror the observed eye, and winks are unavailable.
+
+    While a wink is held (``hold_wink_*``, e.g. a drag), blinks are not detected: the other
+    eye's natural blinks close both eyes for a moment and would otherwise count toward a
+    double blink.
     """
 
     def __init__(self, settings: GestureSettings | None = None) -> None:
@@ -43,11 +47,13 @@ class GestureRecognizer:
             observed = left if left is not None else right
             blink_sig = EyeSignal(sig.t, observed, observed, sig.gaze_x, sig.gaze_y)
 
-        events = [
-            *self.blink.update(blink_sig),
-            *self.wink.update(sig),
-            *self.glance.update(sig),
-        ]
+        wink_events = self.wink.update(sig)
+        if self.wink.holding or any(e.phase == "end" for e in wink_events):
+            self.blink.reset()
+            blink_events = []
+        else:
+            blink_events = self.blink.update(blink_sig)
+        events = [*blink_events, *wink_events, *self.glance.update(sig)]
         return GestureFrame(
             events=tuple(events),
             any_closed=any_closed,

@@ -45,6 +45,8 @@ gestures:
   wink:
     min_wink_ms: 200
     long_wink_ms: 800
+    hold_press_ms: 300       # a held wink presses the button after this long (drag)
+    multi_wink_gap_ms: 500   # winks this close together count as double/triple
   glance:
     edge_margin: 0.02        # how far past the screen edge counts (normalised screen units)
     max_glance_ms: 700
@@ -52,12 +54,13 @@ gestures:
     hold_repeat_ms: 350      # holds repeat while held (null = fire once)
   bindings:
     long_blink: {mouse: click}
-    double_blink: {mouse: double_click}
+    double_blink: {mouse: click}          # left click
     triple_blink: {app: toggle_cursor}
-    wink_left: {mouse: right_click}
-    wink_right: {key: "cmd+tab"}
-    long_wink_left: {app: pause}
-    long_wink_right: {app: recalibrate}
+    # Left eye = left button held: wink and hold to press, look to drag, reopen to release.
+    hold_wink_left: {mouse: hold}
+    # Right eye = right button. Two quick winks = a double right-click.
+    wink_right: {mouse: right_click}
+    long_wink_right: {app: pause}         # hands-free stop / resume
     glance_left: {key: "cmd+["}
     glance_right: {key: "cmd+]"}
     hold_up: {mouse: scroll_up}

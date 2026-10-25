@@ -6,7 +6,9 @@ open/closed state (for gestures), and preview images.
 
 * Mode A: MediaPipe on the head camera gives both the head pose and iris features.
 * Modes B/C: each eye camera goes through its own eye pipeline (``gaze.pipeline``:
-  ``pupil_2d`` or ``eye_3d``); MediaPipe on the head camera, if there is one, gives head pose.
+  ``pupil_2d`` or ``eye_3d``). Head rotation comes from the head-mounted IMU (``imu:``),
+  anchored and drift-corrected by the webcam when one sees the face; head position comes
+  from the webcam. Without an IMU, the webcam gives both.
 
 A camera whose newest frame was already processed is not processed again; its last result is
 reused, which also keeps duplicate frames out of the 3D eye model's fit.
@@ -15,6 +17,7 @@ reused, which also keeps duplicate frames out of the 3D eye model's fit.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field, replace
 
 import cv2
@@ -24,6 +27,8 @@ from opengaze.cameras.types import CameraFrame, CameraRole, PixelFormat
 from opengaze.config.schema import AppConfig, HardwareProfile
 from opengaze.gaze.features import build_eye_features
 from opengaze.gaze.pipelines import EyePipeline, EyeResult, EyeSide, make_eye_pipeline
+from opengaze.imu.head import HeadPoseFusion
+from opengaze.imu.runtime import ImuHealth, ImuRuntime
 from opengaze.modes import TrackingMode, infer_mode, profile_schema
 from opengaze.vision.feature_extractor import build_mode_a
 from opengaze.vision.observations import EyeObservation, FeatureVector, HeadObservation
@@ -49,6 +54,10 @@ class TrackerFrame:
     head_image: np.ndarray | None  # BGR, normalised, with iris overlay in Mode A
     eye_images: dict[str, np.ndarray] = field(default_factory=dict)  # side → BGR with overlay
     eye_results: dict[str, EyeResult] = field(default_factory=dict)  # Modes B/C only
+    # Raw frame each camera contributed (camera id → frame), and whether it was new this step
+    # rather than a repeat of the last one. Debug tracing and session recording read these.
+    camera_frames: dict[str, CameraFrame] = field(default_factory=dict)
+    fresh: dict[str, bool] = field(default_factory=dict)
 
 
 class GazeTracker:
@@ -58,7 +67,10 @@ class GazeTracker:
         config: AppConfig,
         *,
         face_detector: object | None = None,
+        imu: ImuRuntime | None = None,
     ) -> None:
+        """``imu``: an already-running IMU runtime to use instead of starting one from the
+        profile (tests, or sharing one between trackers)."""
         self.profile = profile
         self.mode = infer_mode(cam.role for cam in profile.enabled_cameras.values())
         self.schema_id = profile_schema(profile)
@@ -76,9 +88,28 @@ class GazeTracker:
         if face_detector is not None:
             self.face_detector, self._owns_face = face_detector, False
         elif self.head_ids:
-            self.face_detector, self._owns_face = make_face_detector(config), True
+            head_cam = enabled[self.head_ids[0]]
+            self.face_detector = make_face_detector(
+                config,
+                mirrored=head_cam.mirror_horizontal,
+                hfov_deg=head_cam.optics.horizontal_fov_deg or DEFAULT_HEAD_HFOV_DEG,
+            )
+            self._owns_face = True
         else:
             self.face_detector, self._owns_face = None, False
+
+        # Head-mounted IMU (Modes B/C only; Mode A's head pose is the webcam's).
+        self.imu: ImuRuntime | None = None
+        self._owns_imu = False
+        self.head_fusion: HeadPoseFusion | None = None
+        imu_cfg = profile.imu
+        if not self.is_mode_a and (imu is not None or (imu_cfg is not None and imu_cfg.enabled)):
+            if imu is None:
+                imu = ImuRuntime.from_config(imu_cfg)
+                imu.start()
+                self._owns_imu = True
+            self.imu = imu
+            self.head_fusion = HeadPoseFusion(imu_cfg.webcam_yaw_rate if imu_cfg else 0.5)
 
         self._last_seq: dict[str, tuple[int, int]] = {}
         self._head_cache: tuple[HeadObservation | None, list[EyeObservation], np.ndarray] | None
@@ -103,13 +134,16 @@ class GazeTracker:
         mp_eyes: list[EyeObservation] = []
         head_image: np.ndarray | None = None
         any_frame = False
+        raw: dict[str, CameraFrame] = {}
+        fresh: dict[str, bool] = {}
 
         for cid in self.head_ids:
             frame = manager.latest(cid)  # type: ignore[attr-defined]
             if frame is None:
                 continue
             any_frame = True
-            if self._fresh(cid, frame) or self._head_cache is None:
+            raw[cid], fresh[cid] = frame, self._fresh(cid, frame)
+            if fresh[cid] or self._head_cache is None:
                 frame = self.normalizer(frame)
                 h, eyes = None, []
                 if self.face_detector is not None:
@@ -134,6 +168,8 @@ class GazeTracker:
                 left.blink if left is not None else None,
                 right.blink if right is not None else None,
                 head_image,
+                camera_frames=raw,
+                fresh=fresh,
             )
 
         results: dict[str, EyeResult] = {}
@@ -143,7 +179,8 @@ class GazeTracker:
             if frame is None:
                 continue
             any_frame = True
-            if self._fresh(cid, frame) or side not in self._eye_cache:
+            raw[cid], fresh[cid] = frame, self._fresh(cid, frame)
+            if fresh[cid] or side not in self._eye_cache:
                 frame = self.normalizer(frame)
                 result = self.pipelines[side].process(
                     _to_gray(frame),
@@ -154,6 +191,11 @@ class GazeTracker:
                 )
                 self._eye_cache[side] = (result, _draw_pupil(_to_bgr(frame), result))
             results[side], eye_images[side] = self._eye_cache[side]
+
+        if self.imu is not None and self.head_fusion is not None:
+            stamps = [r.t_ns for r in results.values()]
+            t_ref = max(stamps) if stamps else time.monotonic_ns()
+            head = self.head_fusion.update(self.imu.pose_at(t_ref), head, t_ref)
 
         left_r, right_r = results.get("left"), results.get("right")
         fv = build_eye_features(self.schema_id, head, left_r, right_r) if any_frame else None
@@ -167,6 +209,8 @@ class GazeTracker:
             head_image,
             eye_images,
             results,
+            raw,
+            fresh,
         )
 
     def refeature(self, frame: TrackerFrame) -> FeatureVector | None:
@@ -190,6 +234,22 @@ class GazeTracker:
     # Learned eye-model state (eye_3d): freeze after calibration, persist with it
     # ------------------------------------------------------------------
 
+    def eye_model_ready(self, frame: TrackerFrame) -> bool:
+        """False while a 3D eye model is still fitting: until it is, an eye gives no gaze
+        direction, and calibration samples carry no eye features. It fits from varied eye
+        movement, so staring at one calibration dot would never get it there."""
+        if self.is_mode_a or self.profile.gaze.pipeline != "eye_3d":
+            return True
+        return any(r.gaze is not None for r in frame.eye_results.values())
+
+    def recenter(self) -> None:
+        """Take the current head heading as facing the screen (IMU yaw drift reset)."""
+        if self.head_fusion is not None:
+            self.head_fusion.recenter()
+
+    def imu_health(self) -> ImuHealth | None:
+        return self.imu.health() if self.imu is not None else None
+
     def freeze(self, frozen: bool = True) -> None:
         for p in self.pipelines.values():
             p.freeze(frozen)
@@ -203,6 +263,9 @@ class GazeTracker:
                 self.pipelines[side].load_state_arrays(state)  # type: ignore[index]
 
     def close(self) -> None:
+        if self._owns_imu and self.imu is not None:
+            self.imu.stop()
+            self.imu = None
         if self._owns_face and self.face_detector is not None:
             self.face_detector.close()  # type: ignore[attr-defined]
             self.face_detector = None
@@ -213,7 +276,13 @@ class GazeTracker:
 # ---------------------------------------------------------------------------
 
 
-def make_face_detector(config: AppConfig) -> object | None:
+# Assumed head-camera field of view when the profile doesn't give optics (scales distance).
+DEFAULT_HEAD_HFOV_DEG = 60.0
+
+
+def make_face_detector(
+    config: AppConfig, *, mirrored: bool = False, hfov_deg: float = DEFAULT_HEAD_HFOV_DEG
+) -> object | None:
     """MediaPipe FaceLandmarker if enabled, installed and downloaded; otherwise None."""
     if not config.vision.enable_face_tracking:
         return None
@@ -224,7 +293,7 @@ def make_face_detector(config: AppConfig) -> object | None:
         if not path.exists():
             log.warning("MediaPipe model not found — run 'opengaze download-models'")
             return None
-        return FaceLandmarkDetector(path)
+        return FaceLandmarkDetector(path, mirrored=mirrored, hfov_deg=hfov_deg)
     except ImportError:
         log.warning("mediapipe not installed; no face tracking / head pose")
         return None

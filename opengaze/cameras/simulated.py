@@ -46,7 +46,9 @@ class SyntheticOptions(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     pattern: Literal["eye", "test_card"] = "eye"
-    motion: Literal["lissajous", "saccades", "static"] = "lissajous"
+    # puppet: look wherever opengaze.debug.puppet says (calibration dots, the simulator);
+    # saccades while nothing is set.
+    motion: Literal["lissajous", "saccades", "static", "puppet"] = "lissajous"
     # Shared by both eyes of a rig so they look at the same target; noise is per camera.
     motion_seed: int = 0
     noise_seed: int | None = None
@@ -95,6 +97,12 @@ class GazeTrajectory:
         return float(x), float(y)
 
     def __call__(self, t: float) -> tuple[float, float]:
+        if self.motion == "puppet":
+            from opengaze.debug import puppet
+
+            target = puppet.target()
+            if target is not None:
+                return target
         if self.motion == "static":
             return 0.5, 0.5
         if self.motion == "lissajous":

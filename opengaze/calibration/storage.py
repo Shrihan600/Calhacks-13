@@ -36,7 +36,7 @@ from opengaze.config.fingerprint import (
     profile_fingerprint,
 )
 from opengaze.config.schema import HardwareProfile
-from opengaze.vision.observations import SchemaId
+from opengaze.vision.observations import FEATURE_LAYOUT_VERSION, SchemaId
 
 _STORE_DIR = Path.home() / ".config" / "opengaze" / "calibrations"
 _SUFFIX = ".calib.npz"
@@ -44,9 +44,19 @@ _SUFFIX = ".calib.npz"
 
 def tracking_snapshot(schema_id: str, profile: HardwareProfile) -> dict[str, Any]:
     """Tracking settings a calibration depends on besides camera geometry."""
-    snap: dict[str, Any] = {"geometry_estimation": profile.calibration.geometry_estimation}
+    snap: dict[str, Any] = {
+        "feature_layout": FEATURE_LAYOUT_VERSION,
+        "geometry_estimation": profile.calibration.geometry_estimation,
+    }
     if schema_id != "A-webcam":
         snap["gaze"] = profile.gaze.model_dump(mode="json")
+        imu = profile.imu
+        # How IMU axes map onto the head changes every head angle; the port doesn't.
+        snap["imu"] = (
+            {"source_type": imu.source_type, "axes": list(imu.axes)}
+            if imu is not None and imu.enabled
+            else None
+        )
     return snap
 
 
@@ -126,12 +136,11 @@ class CalibrationStore:
         compat = _compatibility(data, profile)
         if not compat.compatible:
             raise ValueError(compat.explain())
-        eye_states: dict[str, dict[str, np.ndarray]] = {}
-        for key, value in data.items():
-            if key.startswith("eye_") and "__" in key:
-                side, name = key[len("eye_") :].split("__", 1)
-                eye_states.setdefault(side, {})[name] = value
-        return CalibrationBundle(mapper_from_arrays(data), eye_states)
+        return _bundle(data)
+
+    def path_for(self, schema_id: SchemaId, profile: HardwareProfile) -> Path:
+        """Where this schema + profile's calibration lives (whether or not it exists)."""
+        return self._path_for(schema_id, profile_fingerprint(profile))
 
     def exists(self, schema_id: SchemaId, profile: HardwareProfile) -> bool:
         fp = profile_fingerprint(profile)
@@ -162,6 +171,24 @@ class CalibrationStore:
         return False
 
 
+def load_bundle_file(path: Path) -> CalibrationBundle:
+    """Load a calibration file without checking it against a profile.
+
+    For replaying a recorded session, whose replay profile differs from the rig it was
+    calibrated on only in where the frames come from.
+    """
+    return _bundle(dict(np.load(path, allow_pickle=False)))
+
+
+def _bundle(data: dict[str, Any]) -> CalibrationBundle:
+    eye_states: dict[str, dict[str, np.ndarray]] = {}
+    for key, value in data.items():
+        if key.startswith("eye_") and "__" in key:
+            side, name = key[len("eye_") :].split("__", 1)
+            eye_states.setdefault(side, {})[name] = value
+    return CalibrationBundle(mapper_from_arrays(data), eye_states)
+
+
 def _dumps(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
@@ -169,8 +196,9 @@ def _dumps(obj: Any) -> str:
 def _compatibility(data: dict[str, Any], profile: HardwareProfile) -> CalibrationCompatibility:
     stored_snap: dict[str, Any] = json.loads(bytes(data["geometry_snapshot"]).decode())
     compat = check_calibration_compatibility(stored_snap, profile)
-    if "tracking_snapshot" not in data:  # written before Phase 5: Mode A ridge only
-        return compat
+    if "tracking_snapshot" not in data:  # written before Phase 5, with the old Mode A features
+        old = GeometryChange("tracking.feature_layout", 1, FEATURE_LAYOUT_VERSION)
+        return CalibrationCompatibility(False, (*compat.changes, old))
     stored_tracking = json.loads(bytes(data["tracking_snapshot"]).decode())
     schema_id = bytes(data["schema_id"]).decode()
     changes = [

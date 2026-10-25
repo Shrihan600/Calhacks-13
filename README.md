@@ -95,6 +95,88 @@ image and the image after the profile's rotation, mirror and crop. Synthetic eye
 **GT** marker at the true pupil position, so you can check by eye that the orientation settings are
 right.
 
+### Adaptive calibration
+
+`opengaze calibrate --adaptive` (or **A** in `opengaze run`) replaces the fixed 9-dot grid with
+a stream of dots. The centre and four corners train a first model. Each later dot is a test: if
+the prediction lands within tolerance, the dot passes and the model stays as it is. If not, the dot
+becomes training data and the model is refitted. New dots go to the least-covered parts of the
+screen, with a pull toward regions where tests failed. The run stops after 4 passes in a row or
+30 dots.
+
+Every run writes a log to `~/.config/opengaze/calibration_logs/`, even if you discard the
+calibration. The log holds each target, its raw samples, the prediction, the error and the
+decision. To print the latest log:
+
+```bash
+.venv/bin/opengaze calibration-log
+```
+
+It also replays the log: it fits on the first k dots and tests on the rest, so you can see how
+many calibration points your setup needs.
+
+## Debugging the path to the cursor
+
+Gaze reaches the cursor in stages: cameras → eyes (pupil detection, 3D eye model) → head pose
+→ features → mapping (the calibrated model) → smoothed gaze → cursor. When the cursor doesn't
+move, or moves wrong, these tools find the first stage that breaks. Fix that one first:
+every later stage inherits the damage.
+
+**Before the headset exists.** `configs/hardware/synthetic-headset.yaml` simulates it. Its eyes
+are puppets: they look at each calibration dot, then wander, and a pink square in the run window
+shows where they really look. Run the whole app on it, calibration included:
+
+```bash
+.venv/bin/opengaze run --profile configs/hardware/synthetic-headset.yaml
+```
+
+Or simulate a user headlessly. It calibrates, follows 16 fixations and a smooth pursuit, and
+reports every stage against ground truth: accuracy, jitter, lag. Add fault injection to the
+profile's camera `options` (`noise_std`, `drop_probability`, `latency_ms`, …) to check that a
+fault shows up where you'd expect:
+
+```bash
+.venv/bin/opengaze simulate                       # synthetic headset, 9-point grid
+.venv/bin/opengaze simulate --adaptive --profile my-rig.yaml
+```
+
+The IMU isn't simulated: its own real-time thread can't follow the simulator's virtual clock.
+
+**With the headset.**
+
+1. `opengaze cursor-test` checks the output stage alone: Accessibility permission, the
+   displays, and that posted moves land. If this fails, nothing upstream matters.
+   `opengaze run` also shows a red **Cursor control unavailable** banner, with the fix,
+   whenever it can't drive the cursor. **P** opens the Accessibility settings, and the
+   banner clears by itself once permission is granted.
+2. In `opengaze run`, press **D** for the debug overlay. It shows every stage's health over
+   the last 3 s, and why the cursor isn't moving when it isn't (cursor off, no driver, eye
+   closed, low confidence, …).
+3. `opengaze run --trace` (or **T**) records every tick to
+   `~/.config/opengaze/traces/`: camera frames and latency, pupil detections, head pose,
+   features, model output and why a tick was dropped, smoothed gaze, the cursor position sent
+   and the position read back from macOS. `opengaze trace-report` turns the latest trace into
+   the stage report:
+
+   ```
+   [OK  ] cameras   left_eye=fps:30,age95:0,lat95:283 ...
+            - left_eye: frames reach the tracker 283 ms after capture (p95) — USB bandwidth, ...
+   [WARN] features  skew95_ms=283.3
+   ...
+   First problem: cameras — left_eye: frames reach the tracker 283 ms after capture ...
+   ```
+
+4. `opengaze run --record-video` also saves what each camera gave the tracker, along with the
+   calibration and the trace, in `~/.config/opengaze/sessions/`. `opengaze replay <session>`
+   re-runs it, tick for tick, through the current code. Record a failing session once, then
+   iterate on a fix offline. This saves eye video, so it needs `privacy.allow_recording: true`
+   and shows **● REC VIDEO** while it runs. `opengaze simulate --record DIR` makes a
+   synthetic session to try replay on.
+
+With the 3D eye pipeline, the calibration intro screen waits until the eye model has fitted.
+It fits from varied eye movement, so look around the screen first. Starting early would have
+you staring at one dot that the unfitted model can never use.
+
 ## Eye cameras (Modes B/C)
 
 Each eye camera runs through one of two pipelines, picked by `gaze.pipeline` in the hardware
@@ -111,15 +193,52 @@ have no Apple Silicon wheels, so they aren't wired in. Adding an adapter means i
 `PupilDetector2D` / `EyeModel3D` (`opengaze/gaze/`) and registering it in `DETECTORS_2D` /
 `EYE_MODELS_3D`.
 
-Head pose (MediaPipe on the head camera) and calibration turn the features into a screen
-position. `calibration.geometry_estimation` picks how:
+Head pose and calibration turn the features into a screen position.
+`calibration.geometry_estimation` picks how:
 
-- `data_driven` works with either pipeline. It fits a polynomial of the eye features plus
-  linear head-pose terms. Sub-models per eye subset keep it working when one eye blinks.
-- `geometric` needs `eye_3d`. It rotates each gaze ray by the fitted eye-camera rotation and
-  the measured head pose, then intersects it with the screen plane. It compensates head
-  movement that calibration never saw. It assumes the head camera sits top-centre on the
-  screen and its image is mirrored to match the screen.
+- `data_driven` works with any pipeline. It fits a polynomial of the eye features plus linear
+  head rotation and position terms. Sub-models per eye subset and head part keep it working
+  when one eye blinks or head pose drops out. It only compensates head movement that was seen
+  during calibration.
+- `geometric` needs gaze directions (`eye_3d`, or Mode A). It rotates each gaze ray by the
+  fitted eye rotation and the measured head rotation, starts it at the measured head position,
+  and intersects it with the screen plane. It compensates head movement that calibration
+  never saw. It assumes the head camera sits top-centre on the screen and its image is
+  mirrored to match the screen.
+
+## Head pose
+
+All head poses use one world frame: x right along the screen, y down, z from the user into
+the screen, with the head camera at the origin (`opengaze/vision/head_pose.py`).
+
+- **Mode A (webcam):** MediaPipe face landmarks give head rotation and head position in cm.
+  Distance comes from the ~9 cm eye-corner span, so expect ±10% from person to person.
+  The eye feature is the iris position *within the eye opening*, so moving the head doesn't
+  move it. The webcam profile uses `geometric` mapping.
+- **Modes B/C (IMU):** a gyro + accelerometer on the glasses frame gives head rotation.
+  Pitch and roll are absolute (gravity). Yaw is relative: it is anchored when calibration
+  starts and on **R** (or a gesture bound to `{app: recenter}`). If a head camera also sees
+  the face, it pulls IMU yaw back toward the webcam's (cancelling drift) and supplies head
+  position. With an IMU only, head position is unknown and is assumed fixed. Without an IMU,
+  the webcam gives both, as in Mode A.
+
+`opengaze diagnostics` shows live yaw/pitch/roll and x/y/z. Turning right, looking up,
+tilting right and moving right should all read positive.
+
+### Connecting an IMU
+
+Add an `imu:` section to the hardware profile (see `configs/hardware/generic-usb.yaml`):
+`source_type: serial` (USB, needs `pip install -e '.[imu]'`) or `udp` (ESP32 / Pi over
+Wi-Fi), the device's units, and `axes`: which IMU axis points to the head's right, the chin,
+and forward. The device sends one reading per line, gyro then accelerometer, optionally led
+by a timestamp in µs:
+
+```
+gx,gy,gz,ax,ay,az
+t_us,gx,gy,gz,ax,ay,az
+```
+
+Gyro bias is learned automatically whenever the head is still.
 
 The 3D eye model learns during calibration, is frozen afterwards, and its state is saved with
 the calibration. If the glasses move on the face, recalibrate. Try it without hardware:
@@ -135,8 +254,22 @@ The same gestures work in every mode. Winks need both eyes observed.
 | family | gestures |
 |---|---|
 | blinks | `long_blink`, `double_blink`, `triple_blink` (single natural blinks are ignored) |
-| winks | `wink_left`, `wink_right`, `long_wink_left`, `long_wink_right` |
+| winks | `wink_left`, `wink_right` (quick repeats count up: 2 = double), `long_wink_left`, `long_wink_right`, `hold_wink_left`, `hold_wink_right` (start after 0.3 s, end on reopening) |
 | glances | `glance_left/right/up/down`: look past a screen edge and back. `hold_left/right/up/down`: stay there; repeats while held |
+
+The default mouse bindings work like a two-button mouse:
+
+| gesture | does |
+|---|---|
+| double blink | left click |
+| left wink, held | hold the left button: look to drag, reopen to release |
+| right wink | right click (two quick right winks = double right-click) |
+| long right wink | pause / resume |
+
+While a left wink holds the button, the cursor follows the open eye. The other eye's natural
+blinks don't end the hold or count as a double blink. Pausing, turning cursor control off,
+calibrating or quitting always releases the button. `{mouse: hold}` only works on the
+`hold_wink_*` gestures, because only they report when the hold ends.
 
 Bind them under `gestures.bindings` in `configs/default.yaml`. Each binding is a system
 keystroke (`{key: "cmd+shift+tab"}`), a mouse action at the gaze point (`{mouse: right_click}`,
@@ -196,7 +329,9 @@ opengaze/gaze/           eye pipelines (2D pupil detector, 3D eye model), GazeTr
 opengaze/calibration/    session, LOO validation, storage, screen mappers (ridge/poly/geometric)
 opengaze/gestures/       blink/wink/glance detectors, recognizer, keybind dispatch
 opengaze/control/        Quartz cursor + keyboard events, smoothing, dwell, safety
-opengaze/desktop/        PySide6 diagnostics window
+opengaze/desktop/        PySide6 windows: diagnostics, calibration, run, activities
+opengaze/debug/          pipeline traces, stage reports, simulated user, record/replay,
+                         cursor self-test
 opengaze/cli.py          `opengaze` command
 scripts/                 make_synthetic_recording.py
 tests/                   pytest suite (hardware-free)

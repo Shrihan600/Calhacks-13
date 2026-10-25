@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
+from typing import Literal
 
 
 class Gesture(enum.StrEnum):
@@ -16,6 +17,10 @@ class Gesture(enum.StrEnum):
     WINK_RIGHT = "wink_right"
     LONG_WINK_LEFT = "long_wink_left"
     LONG_WINK_RIGHT = "long_wink_right"
+    # Held winks: a "start" event once the wink has lasted hold_press_ms, an "end" event when
+    # the eye reopens. Bound to ``mouse: hold``, the button is down in between (drag).
+    HOLD_WINK_LEFT = "hold_wink_left"
+    HOLD_WINK_RIGHT = "hold_wink_right"
     # Glances: look past a screen edge and come straight back.
     GLANCE_LEFT = "glance_left"
     GLANCE_RIGHT = "glance_right"
@@ -50,3 +55,7 @@ class GestureEvent:
     gesture: Gesture
     t: float
     repeat: int = 0  # 0 for the first firing of a hold, 1, 2, … for repeats
+    # Winks: position in a run of quick winks of the same eye (2 = second wink of a double).
+    count: int = 1
+    # Held winks: "start" when the hold begins, "end" when it ends; None for other gestures.
+    phase: Literal["start", "end"] | None = None
