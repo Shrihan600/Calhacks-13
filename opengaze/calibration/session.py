@@ -8,13 +8,16 @@ and model fitting so it can be tested without a display.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
 
-from opengaze.calibration.model import GazeModel, SchemaId
-from opengaze.vision.observations import FeatureVector
+from opengaze.calibration.model import GazeModel, ScreenMapper
+from opengaze.vision.observations import FEATURE_LAYOUTS, FeatureVector, SchemaId
+
+MapperFactory = Callable[[], ScreenMapper]
 
 # Default 9-point grid: (x_norm, y_norm) covering the screen evenly.
 GRID_9: tuple[tuple[float, float], ...] = (
@@ -26,6 +29,13 @@ GRID_9: tuple[tuple[float, float], ...] = (
 # Calibration grid min/max used to remap model output to full [0,1] screen range.
 GRID_LO: float = 0.05
 GRID_HI: float = 0.95
+
+
+def _has_eye(fv: FeatureVector) -> bool:
+    layout = FEATURE_LAYOUTS.get(fv.schema_id)
+    if layout is None or layout.width != len(fv.valid):
+        return bool(fv.valid.any())
+    return any(bool(fv.valid[list(cols)].all()) for cols in layout.eye_values.values())
 
 
 @dataclass
@@ -41,13 +51,35 @@ class CalibrationPoint:
     def n_samples(self) -> int:
         return len(self.samples)
 
+    def _valid_samples(self) -> list[FeatureVector]:
+        """Samples with at least one eye feature: head pose alone (e.g. an IMU that is always
+        valid) says nothing about where the user was looking."""
+        return [s for s in self.samples if _has_eye(s)]
+
     def representative(self) -> np.ndarray | None:
-        """Median of valid samples as a 1-D float32 feature array, or None if insufficient."""
-        valid = [s for s in self.samples if s.valid.any()]
+        """Per-feature median over the samples where that feature was valid, as a 1-D float32
+        array (0.0 where it never was), or None if there are too few usable samples.
+
+        Masking matters: a blink frame holds 0.0 in its eye slots, which would otherwise
+        drag the median toward zero.
+        """
+        valid = self._valid_samples()
         if len(valid) < 3:
             return None
-        matrix = np.stack([s.values for s in valid])  # (n, features)
-        return np.median(matrix, axis=0).astype(np.float32)
+        values = np.stack([s.values for s in valid]).astype(np.float64)  # (n, features)
+        mask = np.stack([s.valid for s in valid])
+        masked = np.where(mask, values, np.nan)
+        out = np.zeros(values.shape[1], dtype=np.float32)
+        cols = mask.any(axis=0)
+        out[cols] = np.nanmedian(masked[:, cols], axis=0)
+        return out
+
+    def representative_valid(self) -> np.ndarray | None:
+        """Which features of ``representative()`` are trustworthy (valid in ≥ half the samples)."""
+        valid = self._valid_samples()
+        if len(valid) < 3:
+            return None
+        return np.stack([s.valid for s in valid]).mean(axis=0) >= 0.5
 
     def mean_confidence(self) -> float:
         if not self.samples:
@@ -59,7 +91,7 @@ class CalibrationPoint:
 class SessionResult:
     """Output of a completed calibration session."""
 
-    model: GazeModel
+    model: ScreenMapper
     points: list[CalibrationPoint]
     schema_id: SchemaId
     completed_at_ns: int
@@ -88,13 +120,18 @@ class CalibrationSession:
         collect_duration_s: float = 1.5,
         settle_time_s: float = 0.0,
         alpha: float = 1.0,
+        mapper_factory: MapperFactory | None = None,
     ) -> None:
+        """``mapper_factory`` builds the model to fit (default: Mode A ridge ``GazeModel``)."""
         self.schema_id = schema_id
         self.targets = targets
         self.min_samples_per_point = min_samples_per_point
         self.collect_duration_s = collect_duration_s
         self.settle_time_s = settle_time_s  # skip this many seconds after dot appears
         self._alpha = alpha
+        self._mapper_factory = mapper_factory or (
+            lambda: GazeModel(schema_id=self.schema_id, alpha=self._alpha)
+        )
         self.points: list[CalibrationPoint] = [
             CalibrationPoint(sx, sy) for sx, sy in targets
         ]
@@ -164,21 +201,12 @@ class CalibrationSession:
                 f"only {len(good)} accepted calibration point(s); need at least 4"
             )
 
-        X_rows, y_rows = [], []
-        for _, pt in good:
-            rep = pt.representative()
-            if rep is not None:
-                X_rows.append(rep)
-                y_rows.append([pt.screen_x_norm, pt.screen_y_norm])
-
-        X = np.stack(X_rows).astype(np.float32)
-        y = np.array(y_rows, dtype=np.float32)
-
-        model = GazeModel(schema_id=self.schema_id, alpha=self._alpha)
-        model.fit(X, y)
+        X, y, valid = stack_points([p for _, p in good])
+        model = self._mapper_factory()
+        model.fit(X, y, valid)
 
         # Training error (leave-nothing-out — just a sanity check).
-        preds = np.array([model.predict_raw(x) for x in X])
+        preds = np.array([model.predict_raw(x, v) for x, v in zip(X, valid, strict=True)])
         errors = np.linalg.norm(preds - y, axis=1)
         mean_err_norm = float(errors.mean())
 
@@ -222,3 +250,22 @@ class CalibrationSession:
     @property
     def n_targets(self) -> int:
         return len(self.points)
+
+
+def stack_points(
+    points: list[CalibrationPoint],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(X, y, valid) from points that have a representative sample."""
+    X_rows, y_rows, v_rows = [], [], []
+    for pt in points:
+        rep, rep_valid = pt.representative(), pt.representative_valid()
+        if rep is None or rep_valid is None:
+            continue
+        X_rows.append(rep)
+        v_rows.append(rep_valid)
+        y_rows.append([pt.screen_x_norm, pt.screen_y_norm])
+    return (
+        np.stack(X_rows).astype(np.float32),
+        np.array(y_rows, dtype=np.float32),
+        np.stack(v_rows),
+    )

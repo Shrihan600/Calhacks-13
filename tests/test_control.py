@@ -16,6 +16,9 @@ from opengaze.control.safety import ConfidenceGate, EmergencyStop, JumpDetector
 from opengaze.control.driver import GazeDriver
 from opengaze.calibration.model import GazeModel
 from opengaze.vision.observations import FeatureVector
+from opengaze.vision.observations import FEATURE_LAYOUTS
+
+_W = FEATURE_LAYOUTS["A-webcam"].width  # Mode A feature width
 
 
 # ---------------------------------------------------------------------------
@@ -50,10 +53,10 @@ def _fitted_model() -> GazeModel:
 
 
 def _fv(x: float = 0.5, y: float = 0.5) -> FeatureVector:
-    values = np.zeros(12, dtype=np.float32)
+    values = np.zeros(_W, dtype=np.float32)
     values[0] = x; values[1] = y
     values[3] = x; values[4] = y
-    valid = np.ones(12, dtype=bool)
+    valid = np.ones(_W, dtype=bool)
     return FeatureVector(
         t_ns=time.time_ns(), values=values, valid=valid,
         schema_id="A-webcam", max_skew_ns=0,
@@ -287,10 +290,10 @@ class TestGazeDriver:
     def test_low_confidence_drops_frame(self):
         driver, cursor = self._driver(min_confidence=0.9)
         fv = _fv(0.5, 0.5)
-        # confidence = fraction of valid features; _fv has all 12 valid → 1.0
+        # confidence = fraction of valid features; _fv has every feature valid → 1.0
         # So let's make most invalid
-        values = np.zeros(12, dtype=np.float32)
-        valid = np.zeros(12, dtype=bool)
+        values = np.zeros(_W, dtype=np.float32)
+        valid = np.zeros(_W, dtype=bool)
         fv2 = FeatureVector(
             t_ns=0, values=values, valid=valid,
             schema_id="A-webcam", max_skew_ns=0,
@@ -338,11 +341,92 @@ class TestGazeDriver:
 
 
 # ---------------------------------------------------------------------------
+# QuartzCursorDriver event logic (Quartz faked: no display or permission needed)
+# ---------------------------------------------------------------------------
+
+
+class _FakeQuartz:
+    kCGEventMouseMoved, kCGEventLeftMouseDragged = "moved", "dragged"
+    kCGEventLeftMouseDown, kCGEventLeftMouseUp = "left_down", "left_up"
+    kCGEventRightMouseDown, kCGEventRightMouseUp = "right_down", "right_up"
+    kCGEventOtherMouseDown, kCGEventOtherMouseUp = "other_down", "other_up"
+    kCGMouseButtonLeft, kCGMouseButtonRight, kCGMouseButtonCenter = 0, 1, 2
+    kCGMouseEventClickState = "click_state"
+    kCGHIDEventTap = "tap"
+
+    def __init__(self):
+        self.posted = []
+
+    def CGEventCreateMouseEvent(self, _src, kind, pos, _button):  # noqa: N802
+        return {"kind": kind, "pos": tuple(pos)}
+
+    def CGEventSetIntegerValueField(self, event, _field, value):  # noqa: N802
+        event["clicks"] = value
+
+    def CGEventPost(self, _tap, event):  # noqa: N802
+        self.posted.append(event)
+
+    def CGEventCreate(self, _src):  # noqa: N802
+        return None
+
+    def CGEventGetLocation(self, _event):  # noqa: N802
+        class _P:
+            x, y = 77.0, 88.0
+        return _P()
+
+
+def _driver():
+    from opengaze.control.cursor import QuartzCursorDriver, ScreenSize
+
+    d = object.__new__(QuartzCursorDriver)
+    d._Q = _FakeQuartz()
+    d._screen = ScreenSize(1000, 800)
+    d._origin = (0, 0)
+    d._pressed = False
+    return d
+
+
+class TestQuartzDriverEvents:
+    def test_hold_drags_then_releases(self):
+        d = _driver()
+        d.mouse("press", 10, 20)
+        d.move(30, 40)
+        d.mouse("release", 50, 60)
+        d.move(70, 80)
+        assert [(e["kind"], e["pos"]) for e in d._Q.posted] == [
+            ("left_down", (10, 20)),
+            ("dragged", (30, 40)),   # moves while held are drags
+            ("left_up", (50, 60)),
+            ("moved", (70, 80)),
+        ]
+        assert not d.pressed
+
+    def test_release_is_safe_and_uses_cursor_position(self):
+        d = _driver()
+        d.release()  # nothing held: no event
+        assert d._Q.posted == []
+        d.press(1, 2)
+        d.release()
+        assert d._Q.posted[-1] == {"kind": "left_up", "pos": (77, 88)}
+
+    def test_click_count_marks_double_clicks(self):
+        d = _driver()
+        d.mouse("click", 5, 5)
+        d.mouse("click", 5, 5, count=2)
+        d.mouse("right_click", 9, 9, count=2)
+        assert [(e["kind"], e["clicks"]) for e in d._Q.posted] == [
+            ("left_down", 1), ("left_up", 1),
+            ("left_down", 2), ("left_up", 2),
+            ("right_down", 2), ("right_up", 2),
+        ]
+
+
+# ---------------------------------------------------------------------------
 # UserOverride (system-wide gaze yields to a physical mouse)
 # ---------------------------------------------------------------------------
 
 def test_override_allows_gaze_when_cursor_where_we_left_it():
-    from opengaze.control.tracker import UserOverride
+    from opengaze.control.safety import UserOverride
 
     o = UserOverride(tolerance_px=20, hold_s=2.0)
     o.moved_to(100, 100)
@@ -350,7 +434,7 @@ def test_override_allows_gaze_when_cursor_where_we_left_it():
 
 
 def test_override_holds_after_physical_mouse_move():
-    from opengaze.control.tracker import UserOverride
+    from opengaze.control.safety import UserOverride
 
     o = UserOverride(tolerance_px=20, hold_s=2.0)
     o.moved_to(100, 100)
@@ -360,6 +444,6 @@ def test_override_holds_after_physical_mouse_move():
 
 
 def test_override_before_any_gaze_move_allows():
-    from opengaze.control.tracker import UserOverride
+    from opengaze.control.safety import UserOverride
 
     assert UserOverride().gaze_allowed((0, 0), now=0.0)

@@ -33,6 +33,7 @@ def errors(report) -> list[str]:
     [
         ("webcam-only.yaml", TrackingMode.WEBCAM_ONLY),
         ("synthetic-dual-eye.yaml", TrackingMode.DUAL_EYE),
+        ("synthetic-dual-eye-3d.yaml", TrackingMode.DUAL_EYE),
         ("synthetic-faults.yaml", TrackingMode.DUAL_EYE),
     ],
 )
@@ -134,10 +135,66 @@ def test_disabled_cameras_do_not_count() -> None:
     assert report.mode is TrackingMode.SINGLE_EYE
 
 
-def test_geometric_estimation_not_yet_supported() -> None:
+def test_geometric_estimation_allowed_in_mode_a() -> None:
+    # Mode A's webcam eye features are gaze directions, so ray-plane mapping works.
     data = profile(head={"source_type": "synthetic"})
     data["hardware_profile"]["calibration"] = {"geometry_estimation": "geometric"}
-    assert any("not implemented" in e for e in errors(check_profile_data(data)))
+    report = check_profile_data(data)
+    assert report.ok, errors(report)
+
+
+def _messages(report, severity):
+    return [f"{i.location}: {i.message}" for i in report.issues if i.severity == severity]
+
+
+def test_imu_profile_validation() -> None:
+    data = profile(left_eye={"source_type": "synthetic"})
+    data["hardware_profile"]["imu"] = {"source_type": "synthetic", "axes": ["+x", "-z", "+y"]}
+    report = check_profile_data(data)
+    assert report.ok, errors(report)
+    assert any("head position isn't" in m for m in _messages(report, "info"))
+
+    data["hardware_profile"]["imu"] = {"source_type": "bluetooth"}
+    assert any(e.startswith("imu.source_type") for e in errors(check_profile_data(data)))
+
+    data["hardware_profile"]["imu"] = {"source_type": "udp", "options": {"prot": 1}}
+    assert any(e.startswith("imu.options") for e in errors(check_profile_data(data)))
+
+
+def test_imu_axes_must_be_a_proper_rotation() -> None:
+    data = profile(left_eye={"source_type": "synthetic"})
+    data["hardware_profile"]["imu"] = {"source_type": "synthetic", "axes": ["+x", "+y", "-z"]}
+    assert any("mirrored" in e for e in errors(check_profile_data(data)))
+    data["hardware_profile"]["imu"] = {"source_type": "synthetic", "axes": ["+x", "+x", "+z"]}
+    assert any("once each" in e for e in errors(check_profile_data(data)))
+
+
+def test_imu_ignored_in_mode_a() -> None:
+    data = profile(head={"source_type": "synthetic"})
+    data["hardware_profile"]["imu"] = {"source_type": "synthetic"}
+    report = check_profile_data(data)
+    assert any("ignored in Mode A" in m for m in _messages(report, "warning"))
+
+
+def test_geometric_estimation_needs_eye_3d_pipeline() -> None:
+    data = profile(left_eye={"source_type": "synthetic"})
+    data["hardware_profile"]["calibration"] = {"geometry_estimation": "geometric"}
+    assert any("eye_3d" in e for e in errors(check_profile_data(data)))
+    data["hardware_profile"]["gaze"] = {"pipeline": "eye_3d"}
+    report = check_profile_data(data)
+    assert report.ok, errors(report)
+
+
+def test_gaze_components_are_validated() -> None:
+    data = profile(left_eye={"source_type": "synthetic"})
+    data["hardware_profile"]["gaze"] = {
+        "pipeline": "eye_3d",
+        "detector_2d": {"type": "nope"},
+        "eye_model_3d": {"type": "sphere_fit", "options": {"buffer_sizee": 10}},
+    }
+    errs = errors(check_profile_data(data))
+    assert any(e.startswith("gaze.detector_2d.type") for e in errs)
+    assert any(e.startswith("gaze.eye_model_3d.options") for e in errs)
 
 
 def test_user_overlay_merges_over_profile(tmp_path: Path) -> None:

@@ -10,8 +10,12 @@ Flow
 3. After all dots: fit model, run LOO validation, show error map.
 4. Save on Space/click; discard on Escape.
 
-The window owns a CaptureRuntime and FaceLandmarkDetector.  It polls both on
-a QTimer so the UI never blocks on camera or vision.
+The window polls a ``GazeTracker`` (Mode A, B or C, per the profile) on a QTimer so the UI
+never blocks on camera or vision.
+
+With the 3D eye pipeline, the eye models keep learning on the intro screen and during
+collection, then are frozen before fitting; every sample is re-expressed under the frozen
+eyeball geometry (``GazeTracker.refeature``), and that geometry is saved with the calibration.
 """
 
 from __future__ import annotations
@@ -19,23 +23,22 @@ from __future__ import annotations
 import logging
 import sys
 import time
-from pathlib import Path
 
-import numpy as np
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QKeyEvent, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
+from opengaze.calibration.mappers import make_mapper
+from opengaze.calibration.model import ScreenMapper
 from opengaze.calibration.session import GRID_9, CalibrationSession, SessionResult
 from opengaze.calibration.storage import CalibrationStore
 from opengaze.calibration.validation import ValidationReport, validate_calibration
 from opengaze.cameras.manager import CameraManager
 from opengaze.cameras.runtime import CaptureRuntime
-from opengaze.cameras.types import CameraRole, SourceKind
 from opengaze.config.loader import ProfileReport
 from opengaze.config.schema import AppConfig
-from opengaze.vision.feature_extractor import build_mode_a
-from opengaze.vision.preprocessing import FrameNormalizer
+from opengaze.debug import puppet
+from opengaze.gaze.tracker import GazeTracker, TrackerFrame
 
 log = logging.getLogger("opengaze.calibration_ui")
 
@@ -89,6 +92,7 @@ class CalibrationWindow(QWidget):
         config: AppConfig,
         store: CalibrationStore | None = None,
         owns_runtime: bool = True,
+        tracker: GazeTracker | None = None,
     ) -> None:
         super().__init__()
         assert report.profile is not None
@@ -99,33 +103,25 @@ class CalibrationWindow(QWidget):
         self._owns_runtime = owns_runtime
 
         # Vision pipeline
-        self.normalizer = FrameNormalizer()
-        self._detector = _try_create_detector(config)
-        self._head_camera_ids = {
-            cid
-            for cid, cam in report.profile.enabled_cameras.items()
-            if cam.role is CameraRole.HEAD
-        }
-
-        # Infer schema_id from tracking mode
-        from opengaze.modes import infer_mode, TrackingMode
-        mode = infer_mode({cam.role for cam in report.profile.enabled_cameras.values()})
-        schema_map = {
-            TrackingMode.WEBCAM_ONLY: "A-webcam",
-            TrackingMode.SINGLE_EYE: "B-single-eye",
-            TrackingMode.DUAL_EYE: "C-dual-eye",
-        }
-        self._schema_id = schema_map.get(mode, "A-webcam")
+        self._owns_tracker = tracker is None
+        self.tracker = tracker or GazeTracker(report.profile, config)
+        self.tracker.freeze(False)  # recalibrating: let a 3D eye model keep learning
+        self._schema_id = self.tracker.schema_id
+        estimation = report.profile.calibration.geometry_estimation
+        self._mapper_factory = lambda: make_mapper(self._schema_id, estimation)
 
         self.session = CalibrationSession(
             schema_id=self._schema_id,
             targets=GRID_9,
             collect_duration_s=1.5,
             settle_time_s=0.35,  # discard first 350ms — eye still in saccade to dot
+            mapper_factory=self._mapper_factory,
         )
+        self._records: dict[int, list[TrackerFrame]] = {}
 
         # State
         self._state = _State.IDLE
+        self._eye_ready = False  # a 3D eye model has fitted (always True for other pipelines)
         self._current_point = 0
         self._flash_start: float | None = None
         self._flash_ok = True
@@ -148,7 +144,15 @@ class CalibrationWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _tick(self) -> None:
-        if self._state == _State.COLLECTING:
+        # Simulated rigs (``motion: puppet``): the synthetic eyes look at the active dot.
+        if self._state in (_State.COLLECTING, _State.FLASH):
+            pt = self.session.points[min(self._current_point, self.session.n_targets - 1)]
+            puppet.look_at(pt.screen_x_norm, pt.screen_y_norm)
+        else:
+            puppet.release()
+        if self._state == _State.IDLE:
+            self._warm_up()
+        elif self._state == _State.COLLECTING:
             self._collect_frame()
             if not self.session.collecting:
                 ok = self.session.finish_point(self._current_point)
@@ -172,30 +176,39 @@ class CalibrationWindow(QWidget):
         self.update()
 
     def _collect_frame(self) -> None:
-        if self._detector is None:
+        frame = self.tracker.step(self.runtime.manager)
+        if frame.features is None:
             return
-        for cid in self._head_camera_ids:
-            frame = self.runtime.manager.latest(cid)
-            if frame is None:
-                continue
-            frame = self.normalizer(frame)
-            try:
-                head, eyes = self._detector.detect(frame)
-            except Exception:
-                continue
-            fv = build_mode_a(head, eyes[0] if eyes else None, eyes[1] if len(eyes) > 1 else None)
-            self.session.add_sample(fv)
+        # Keep the frame only if the sample was stored (not during the settle window, nor a
+        # wrong schema), so frames and samples stay paired for refeature() in _finish.
+        point = self.session.points[self._current_point]
+        before = point.n_samples
+        self.session.add_sample(frame.features)
+        if point.n_samples > before:
+            self._records.setdefault(self._current_point, []).append(frame)
 
     def _start_collecting(self) -> None:
+        if self._current_point == 0:
+            # The user is facing the screen to start: anchor IMU heading here, so later
+            # recentres (and the next session) agree with this calibration's baseline.
+            self.tracker.recenter()
         self.session.start_point(self._current_point)
+        self._records[self._current_point] = []
         self._state = _State.COLLECTING
 
     def _finish(self) -> None:
         w, h = self.width(), self.height()
+        # Freeze learned eye geometry and re-express every sample under it.
+        self.tracker.freeze(True)
+        for i, pt in enumerate(self.session.points):
+            records = self._records.get(i, [])
+            if len(records) == len(pt.samples):
+                pt.samples = [fv for r in records if (fv := self.tracker.refeature(r)) is not None]
         try:
             self._result = self.session.fit(screen_width_px=w, screen_height_px=h)
         except ValueError as exc:
             log.warning("calibration fit failed: %s", exc)
+            self.tracker.freeze(False)
             self._state = _State.IDLE
             return
         try:
@@ -204,9 +217,10 @@ class CalibrationWindow(QWidget):
                 schema_id=self._schema_id,
                 # Mode A (webcam-only) is inherently coarse — 0.15 norm ≈ 150–290px
                 # depending on screen size, which is realistic for iris-from-webcam.
-                pass_threshold_norm=0.15,
+                pass_threshold_norm=0.15 if self.tracker.is_mode_a else 0.08,
                 screen_width_px=w,
                 screen_height_px=h,
+                mapper_factory=self._mapper_factory,
             )
         except ValueError:
             self._validation = None
@@ -228,8 +242,15 @@ class CalibrationWindow(QWidget):
     def mousePressEvent(self, event) -> None:  # noqa: N802
         self._on_advance()
 
+    def _warm_up(self) -> None:
+        """Intro screen: keep the tracker running so a 3D eye model can fit."""
+        frame = self.tracker.step(self.runtime.manager)
+        self._eye_ready = self._eye_ready or self.tracker.eye_model_ready(frame)
+
     def _on_advance(self) -> None:
         if self._state == _State.IDLE:
+            if not self._eye_ready:
+                return  # the intro screen says why
             self._current_point = 0
             self._start_collecting()
         elif self._state == _State.RESULT:
@@ -237,10 +258,14 @@ class CalibrationWindow(QWidget):
         elif self._state == _State.DONE:
             self.close()
 
+    def _fitted_model(self) -> ScreenMapper | None:
+        return self._result.model if self._result is not None else None
+
     def _save_and_close(self) -> None:
-        if self._result is not None and not self._saved:
+        model = self._fitted_model()
+        if model is not None and not self._saved:
             try:
-                path = self.store.save(self._result.model, self.profile)
+                path = self.store.save(model, self.profile, eye_states=self.tracker.eye_states())
                 log.info("calibration saved to %s", path)
                 self._saved = True
             except Exception as exc:
@@ -269,7 +294,13 @@ class CalibrationWindow(QWidget):
         p.end()
 
     def _draw_idle(self, p: QPainter) -> None:
-        self._draw_text(p, "Look at each dot and hold your gaze.\n\nPress Space or click to begin.", 0.5, 0.5)
+        text = "Look at each dot and hold your gaze.\n\n" + self._start_hint()
+        self._draw_text(p, text, 0.5, 0.5)
+
+    def _start_hint(self) -> str:
+        if self._eye_ready:
+            return "Press Space or click to begin."
+        return "Look around the whole screen for a few seconds:\nthe 3D eye model is still fitting."
 
     def _draw_collecting(self, p: QPainter) -> None:
         w, h = self.width(), self.height()
@@ -393,36 +424,17 @@ class CalibrationWindow(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._timer.stop()
+        puppet.release()
         if self._owns_runtime:
             self.runtime.stop()
-        if self._detector is not None:
-            self._detector.close()
+        if self._owns_tracker:
+            self.tracker.close()
         super().closeEvent(event)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _try_create_detector(config: AppConfig) -> object | None:
-    if not config.vision.enable_face_tracking:
-        return None
-    try:
-        from opengaze.vision.mediapipe_detector import FaceLandmarkDetector, default_model_path
-        model_path = config.vision.face_landmarker_model_path or default_model_path()
-        if not model_path.exists():
-            log.warning(
-                "MediaPipe model not found — run 'opengaze download-models' before calibrating"
-            )
-            return None
-        return FaceLandmarkDetector(model_path)
-    except ImportError:
-        log.warning("mediapipe not installed; calibration will collect no samples")
-        return None
-    except Exception as exc:
-        log.error("could not create detector: %s", exc)
-        return None
-
 
 def run_calibration(report: ProfileReport, config: AppConfig) -> int:
     assert report.profile is not None

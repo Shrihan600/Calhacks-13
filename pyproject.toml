@@ -26,6 +26,9 @@ tracking = [
     "scipy>=1.11",
     "scikit-learn>=1.4",
 ]
+imu = [
+    "pyserial>=3.5",  # USB-serial IMUs; UDP and synthetic IMUs need nothing extra
+]
 api = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
@@ -35,7 +38,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
 ]
-all = ["opengaze[desktop,tracking,api,dev]"]
+all = ["opengaze[desktop,tracking,imu,api,dev]"]
 
 [project.scripts]
 opengaze = "opengaze.cli:main"

@@ -3,6 +3,7 @@
 ConfidenceGate  — drops samples where the model isn't sure (blink, face lost).
 JumpDetector    — drops samples that jump impossibly far in one frame (outlier).
 EmergencyStop   — hard pause; call trigger() to freeze, reset() to resume.
+UserOverride    — yields the cursor to a physical mouse/trackpad for a moment.
 
 All gates are stateless except JumpDetector (needs previous position) and
 EmergencyStop (toggled by the user).
@@ -87,3 +88,26 @@ class EmergencyStop:
     @property
     def active(self) -> bool:
         return self._active
+
+
+class UserOverride:
+    """Yields the cursor to a physical mouse/trackpad.
+
+    After each gaze move we remember where we put the cursor. If it's found
+    somewhere else, a person moved it, so gaze stays hands-off for ``hold_s``.
+    """
+
+    def __init__(self, tolerance_px: float = 24.0, hold_s: float = 2.0) -> None:
+        self.tolerance_px = tolerance_px
+        self.hold_s = hold_s
+        self._expected: tuple[float, float] | None = None
+        self._hold_until = 0.0
+
+    def moved_to(self, x: float, y: float) -> None:
+        self._expected = (x, y)
+
+    def gaze_allowed(self, actual: tuple[float, float], now: float) -> bool:
+        if self._expected is not None and math.dist(actual, self._expected) > self.tolerance_px:
+            self._hold_until = now + self.hold_s
+            self._expected = None
+        return now >= self._hold_until

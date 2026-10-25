@@ -180,24 +180,104 @@ def semantic_issues(profile: HardwareProfile) -> list[ValidationIssue]:
 
     roles = {cam.role for cam in enabled.values()}
     mode = infer_mode(roles)
+    imu = profile.imu if profile.imu is not None and profile.imu.enabled else None
     if mode is None:
         issues.append(
             ValidationIssue("error", "cameras", "no enabled eye or head camera; nothing to track")
         )
-    elif mode is not TrackingMode.WEBCAM_ONLY and CameraRole.HEAD not in roles:
-        issues.append(
-            ValidationIssue(
-                "warning",
-                "cameras",
-                "no head camera: head movement can't be compensated, so keep the head still",
+    elif mode is not TrackingMode.WEBCAM_ONLY:
+        has_head_cam = CameraRole.HEAD in roles
+        if imu is None and not has_head_cam:
+            issues.append(
+                ValidationIssue(
+                    "warning",
+                    "cameras",
+                    "no IMU and no head camera: head movement can't be compensated, so keep "
+                    "the head still",
+                )
             )
+        elif imu is None:
+            issues.append(
+                ValidationIssue(
+                    "info", "imu", "no IMU: head rotation comes from the webcam alone"
+                )
+            )
+        elif not has_head_cam:
+            issues.append(
+                ValidationIssue(
+                    "info",
+                    "imu",
+                    "IMU without a head camera: head rotation is tracked, head position isn't "
+                    "(assumed fixed) and yaw may drift slowly; recenter while facing the screen",
+                )
+            )
+    elif imu is not None:
+        issues.append(
+            ValidationIssue("warning", "imu", "ignored in Mode A: the webcam gives head pose")
         )
-    if profile.calibration.geometry_estimation == "geometric":
+    if imu is not None:
+        issues += _imu_issues(imu)
+    issues += _gaze_issues(profile, mode)
+    return issues
+
+
+def _imu_issues(imu) -> list[ValidationIssue]:
+    from opengaze.imu.sources import IMU_SOURCES
+
+    cls = IMU_SOURCES.get(imu.source_type)
+    if cls is None:
+        return [
+            ValidationIssue(
+                "error",
+                "imu.source_type",
+                f"unknown {imu.source_type!r}; available: {sorted(IMU_SOURCES)}",
+            )
+        ]
+    try:
+        cls.Options.model_validate(imu.options)
+    except ValidationError as exc:
+        return _pydantic_issues(exc, "imu.options")
+    if cls.source_kind == "synthetic":
+        return [ValidationIssue("info", "imu", "SYNTHETIC IMU — simulated head motion")]
+    return []
+
+
+def _gaze_issues(profile: HardwareProfile, mode: TrackingMode | None) -> list[ValidationIssue]:
+    from opengaze.gaze.detector2d import DETECTORS_2D
+    from opengaze.gaze.eye_model3d import EYE_MODELS_3D
+
+    issues: list[ValidationIssue] = []
+    gaze = profile.gaze
+    components = [("gaze.detector_2d", gaze.detector_2d, DETECTORS_2D)]
+    if gaze.pipeline == "eye_3d":
+        components.append(("gaze.eye_model_3d", gaze.eye_model_3d, EYE_MODELS_3D))
+    for loc, component, registry in components:
+        cls = registry.get(component.type)
+        if cls is None:
+            issues.append(
+                ValidationIssue(
+                    "error",
+                    f"{loc}.type",
+                    f"unknown {component.type!r}; available: {sorted(registry)}",
+                )
+            )
+            continue
+        try:
+            cls.Options.model_validate(component.options)
+        except ValidationError as exc:
+            issues += _pydantic_issues(exc, f"{loc}.options")
+
+    # Mode A's webcam eye features are gaze directions already; Modes B/C need eye_3d.
+    if (
+        profile.calibration.geometry_estimation == "geometric"
+        and mode not in (None, TrackingMode.WEBCAM_ONLY)
+        and gaze.pipeline != "eye_3d"
+    ):
         issues.append(
             ValidationIssue(
                 "error",
                 "calibration.geometry_estimation",
-                "geometric estimation is not implemented yet; use data_driven",
+                "geometric estimation needs a 3D gaze vector; set gaze.pipeline: eye_3d",
             )
         )
     return issues

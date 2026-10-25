@@ -40,6 +40,35 @@ hardware_profile:
       fps: 30
       mounting_position: display_top
 
+  # Head-mounted IMU (gyro + accelerometer) on the glasses frame: head rotation for Modes B/C.
+  # With the head camera also enabled, the webcam anchors yaw (cancels drift) and adds head
+  # position. Remove this section (or enabled: false) to use the webcam alone.
+  imu:
+    source_type: serial        # serial (USB) | udp (ESP32 / Pi over Wi-Fi) | synthetic
+    enabled: false             # set true once the IMU is wired up
+    options:
+      port: /dev/cu.usbmodem1101   # `ls /dev/cu.*`; for udp: {port: 5005}
+      baud: 115200
+      gyro_units: deg_s        # deg_s | rad_s
+      accel_units: g           # g | m_s2
+    # Which IMU axis points to the head's right, the chin, and forward (out of the face).
+    # Must be a proper rotation (the validator explains if not).
+    axes: ["+x", "+y", "+z"]
+    webcam_yaw_rate: 0.5       # how fast the webcam pulls IMU yaw back (0 = never)
+
+  # How eye-camera images become gaze (Modes B/C). Each component is swappable by `type`.
+  gaze:
+    pipeline: pupil_2d           # pupil_2d: pupil centre | eye_3d: 3D eye model → gaze vector
+    detector_2d:
+      type: ellipse_fit          # built-in OpenCV detector
+      options: {}                # e.g. {min_diameter: 0.04, max_diameter: 0.45, min_contrast: 25}
+    eye_model_3d:                # used only with pipeline: eye_3d
+      type: sphere_fit
+      options: {}
+    closed_below_confidence: 0.3 # pupil confidence below this = eye closed (blinks/winks)
+
   calibration:
     screen_mapping: per_user
+    # data_driven: polynomial regression (eye features + head pose → screen), any pipeline.
+    # geometric: rotate the 3D gaze ray by head pose and intersect the screen (eye_3d only).
     geometry_estimation: data_driven

@@ -6,6 +6,7 @@ frame per camera on a timer, so a slow or dead camera can never freeze the UI.
 
 from __future__ import annotations
 
+import logging
 import sys
 
 import cv2
@@ -33,6 +34,8 @@ from opengaze.config.loader import ProfileReport
 from opengaze.config.schema import AppConfig
 from opengaze.vision.observations import EyeObservation, HeadObservation
 from opengaze.vision.preprocessing import FrameNormalizer
+
+log = logging.getLogger(__name__)
 
 STATE_COLORS = {
     CameraState.STREAMING: "#2e9e5b",
@@ -163,9 +166,15 @@ class CameraTile(QFrame):
             ("L" if any(e.eye == "left" and e.blink for e in eyes) else "·")
             + ("R" if any(e.eye == "right" and e.blink for e in eyes) else "·")
         )
+        pos = ""
+        if head.position_cm is not None:
+            x, y, z = head.position_cm
+            pos = f"  pos x {x:+5.1f} y {y:+5.1f} z {z:+6.1f} cm"
+        # Check the signs: turn right → yaw +, look up → pitch +, tilt right → roll +,
+        # move right → x +, move closer → z toward 0.
         self.pose.setText(
             f"yaw {head.yaw_deg:+6.1f}°  pitch {head.pitch_deg:+6.1f}°  "
-            f"roll {head.roll_deg:+6.1f}°  scale {head.relative_scale:.3f}  blink {blinks}"
+            f"roll {head.roll_deg:+6.1f}°{pos}  blink {blinks}"
         )
         self.pose.setVisible(True)
 
@@ -228,7 +237,7 @@ class DiagnosticsWindow(QMainWindow):
         self.manager: CameraManager = runtime.manager
         self.profile = report.profile
         self.normalizer = FrameNormalizer()
-        self._detector = _try_create_detector(config)
+        self._detector = _try_create_detector(config, report.profile)
         self._head_camera_ids = {
             cid
             for cid, cam in report.profile.enabled_cameras.items()
@@ -320,28 +329,20 @@ class DiagnosticsWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def _try_create_detector(config: AppConfig) -> object | None:
-    """Create a FaceLandmarkDetector if tracking is enabled and mediapipe is available."""
-    if not config.vision.enable_face_tracking:
-        return None
-    try:
-        from opengaze.vision.mediapipe_detector import FaceLandmarkDetector, default_model_path
+def _try_create_detector(config: AppConfig, profile) -> object | None:
+    """Create a FaceLandmarkDetector for the head camera if tracking is enabled and available."""
+    from opengaze.gaze.tracker import DEFAULT_HEAD_HFOV_DEG, make_face_detector
 
-        model_path = config.vision.face_landmarker_model_path or default_model_path()
-        if not model_path.exists():
-            log.info(
-                "MediaPipe model not found at %s — run 'opengaze download-models' to enable "
-                "face tracking in the diagnostics window",
-                model_path,
-            )
-            return None
-        return FaceLandmarkDetector(model_path)
-    except ImportError:
-        log.debug("mediapipe not installed; face tracking disabled in diagnostics")
+    head = next(
+        (c for c in profile.enabled_cameras.values() if c.role is CameraRole.HEAD), None
+    )
+    if head is None:
         return None
-    except Exception as exc:
-        log.warning("could not create face landmark detector: %s", exc)
-        return None
+    return make_face_detector(
+        config,
+        mirrored=head.mirror_horizontal,
+        hfov_deg=head.optics.horizontal_fov_deg or DEFAULT_HEAD_HFOV_DEG,
+    )
 
 
 def run_diagnostics(report: ProfileReport, config: AppConfig) -> int:

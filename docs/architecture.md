@@ -131,6 +131,43 @@ FeatureVector   { t_ns,
 GazeSample      { t_ns, screen_xy_norm, confidence, mode, latency_ns }
 ```
 
+**Phase 5 schemas.** Each mode × eye pipeline has its own `schema_id`: `A-webcam`, `B-pupil2d`,
+`C-pupil2d`, `B-eye3d`, `C-eye3d`. `FEATURE_LAYOUTS` in `vision/observations.py` records which
+columns hold each eye's values, its confidence, and the head pose. The `*-pupil2d` layout matches
+Mode A's; the `*-eye3d` layout holds a unit gaze vector plus confidence per eye. Calibration
+files are keyed by schema id, store the mapper kind, and store a *tracking snapshot* (eye
+pipeline config + `geometry_estimation`). A changed pipeline or mapping is reported as
+incompatible, the same way a geometry change is.
+
+### Gaze pipeline (Phase 5)
+
+```
+eye camera ─▶ normalize ─▶ PupilDetector2D ─────────────────────────▶ pupil centre ─┐  pupil_2d
+                                 └──▶ EyeModel3D (learns, then frozen) ─▶ gaze vector ─┤  eye_3d
+head camera ─▶ normalize ─▶ MediaPipe ─▶ head pose (Mode A; B/C: yaw anchor + position) ┤
+IMU ─▶ ImuRuntime (Mahony + bias) ─▶ HeadPoseFusion ─▶ head rotation (Modes B/C) ─────┤
+                                                                                      ▼
+                     FeatureVector(schema) ─▶ ScreenMapper ─▶ OneEuro ─▶ cursor / gestures
+                                              ├ GazeModel             (Mode A, linear ridge)
+                                              ├ PolynomialRidgeMapper (B/C, data_driven)
+                                              └ GeometricRayMapper    (B/C eye_3d, geometric)
+```
+
+Head pose feeds the mappers as two parts that are valid independently: rotation (yaw, pitch,
+roll) and position (x, y, z cm). In Mode A both come from the webcam (`vision/head_pose.py`),
+and the eye feature is the iris direction *within the head*. In Modes B/C rotation comes from
+the head-mounted IMU (`imu/`: sources → Mahony filter with variance-gated gyro-bias learning
+→ `ImuRuntime` thread → `HeadPoseFusion`, which anchors yaw and pulls it toward the webcam
+when a face is visible), and position comes from the webcam when there is one. The
+`FEATURE_LAYOUT_VERSION` in calibration files changed to 2 with this. Older Mode A
+calibrations are reported as incompatible and must be redone.
+
+`GazeTracker` (`gaze/tracker.py`) runs the vision front end for any mode. `GazeLoop`
+(`gaze/loop.py`) adds the mapper, smoothing and gesture recognition, and every desktop window
+uses it. Gestures see the unclipped, unsmoothed gaze, so glances past the screen edge are
+detectable. The cursor freezes while an eye is closed, so blink and wink actions land at the
+pre-blink position.
+
 The feature order is the one in the project brief: left pupil x/y/conf, right pupil x/y/conf, head
 yaw/pitch/roll, head center x/y, relative scale. A calibration model is fitted for one `schema_id` and
 refuses vectors from another, so each mode gets its own model profile. Accuracy is never assumed to
@@ -208,8 +245,9 @@ demo/               demo assets (generated recordings are git-ignored)
    bound to the profile fingerprint.
 4. **Safety and control polish**: One Euro filter, confidence freeze, jump detection, pause/e-stop,
    Accessibility permission wizard.
-5. **External eye cameras (Modes B/C)**: classical pupil detector, ROI editor, single/dual fusion,
-   Pi and ESP32 stream adapters. Hardware arrival gates this phase; the synthetic source keeps it
+5. **External eye cameras (Modes B/C)**: classical pupil detector, 3D eye model, single/dual
+   fusion, head-compensated screen mapping, eye-gesture keybinds (done); ROI editor, Pi and
+   ESP32 stream adapters (planned). Hardware arrival gates this phase; the synthetic source keeps it
    testable before then.
 6. **Communication + sponsors**: AAC board, Claude text help, Cartesia speech, optional Convex.
 7. **Demo polish**: latency/accuracy measurement, scripted 2-minute judge flow, docs.

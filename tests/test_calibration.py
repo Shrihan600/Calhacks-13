@@ -18,6 +18,9 @@ from opengaze.calibration.session import CalibrationPoint, CalibrationSession, G
 from opengaze.calibration.storage import CalibrationStore
 from opengaze.calibration.validation import validate_calibration
 from opengaze.vision.observations import FeatureVector
+from opengaze.vision.observations import FEATURE_LAYOUTS
+
+_W = FEATURE_LAYOUTS["A-webcam"].width  # Mode A feature width
 
 
 # ---------------------------------------------------------------------------
@@ -26,12 +29,12 @@ from opengaze.vision.observations import FeatureVector
 
 def _fv(x: float, y: float, t_ns: int = 0, schema: str = "A-webcam") -> FeatureVector:
     """Minimal FeatureVector: left pupil (x, y), rest zeroed but valid."""
-    values = np.zeros(12, dtype=np.float32)
+    values = np.zeros(_W, dtype=np.float32)
     values[0] = x   # left_pupil_x
     values[1] = y   # left_pupil_y
     values[3] = x   # right_pupil_x (same as left for simplicity)
     values[4] = y
-    valid = np.ones(12, dtype=bool)
+    valid = np.ones(_W, dtype=bool)
     return FeatureVector(
         t_ns=t_ns,
         values=values,
@@ -97,7 +100,7 @@ class TestGazeModel:
     def test_predict_unfitted_raises(self):
         model = GazeModel(schema_id="A-webcam")
         with pytest.raises(RuntimeError, match="not fitted"):
-            model.predict_raw(np.zeros(12, dtype=np.float32))
+            model.predict_raw(np.zeros(_W, dtype=np.float32))
 
     def test_output_clamped_to_unit_square(self):
         pts = [_accepted_point(sx, sy) for sx, sy in GRID_9]
@@ -106,7 +109,7 @@ class TestGazeModel:
         model = GazeModel(schema_id="A-webcam")
         model.fit(X, y)
 
-        extreme = np.full(12, 99.0, dtype=np.float32)
+        extreme = np.full(_W, 99.0, dtype=np.float32)
         px, py = model.predict_raw(extreme)
         assert 0.0 <= px <= 1.0
         assert 0.0 <= py <= 1.0
