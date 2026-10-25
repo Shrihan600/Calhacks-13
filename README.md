@@ -25,6 +25,7 @@ You look at the screen. The software tracks where your eyes are pointing and mov
 | Eye-gesture mouse: double-blink click, held-wink drag, right-wink right click | **Working** |
 | Debug tooling: live overlay, traces, simulated headset, record/replay | **Working** |
 | Eye-camera glasses support (Mode C) + head-mounted IMU | Architecture ready, hardware pending |
+| **EyeMouse consumer app** — guided setup, menu bar, caret-following voice typing, gaze keyboard for any app (`opengaze app`) | **Working** (offscreen + native window checks; not yet tried by an end user) |
 | AAC communication board + Claude AI | Planned |
 
 ---
@@ -119,6 +120,38 @@ Download the MediaPipe face model (~5 MB, done once):
 
 ## Running OpenGaze
 
+### EyeMouse — the consumer app
+
+```bash
+.venv/bin/opengaze app          # or: .venv/bin/eyemouse
+.venv/bin/opengaze app --setup  # run setup again
+```
+
+The everyday app, built from the consumer design. The developer commands below stay as they are.
+
+**First run (done by a helper):** Welcome → allow the camera → turn on Accessibility (the page
+moves on by itself once it's on) → allow the microphone or skip voice → 9-dot calibration
+(fullscreen; a poor fit offers *Try again* / *Use it anyway*) → **Try it out**, where the gaze
+cursor is live: double blink a circle, right wink a card, hold a left wink to drag a block.
+**Done** moves EyeMouse to the menu bar and, if ticked, adds a login item
+(`~/Library/LaunchAgents/com.opengaze.eyemouse.plist`).
+
+**Every day:** the gaze cursor drives the pointer in every app. The menu bar item has the
+gaze switch and its status (*Tracking well*, *Looking for your face*, *Mouse in control*,
+*Paused*), Pause (⌃⌥G), Voice typing, Gaze keyboard, Recalibrate and Settings.
+
+- **Voice typing:** when a text field has focus, a mic floats beside the caret (found through
+  the Accessibility API). Click it, triple blink or press ⌃⌥D, then speak; the words are typed
+  at the caret. Needs the microphone, `CARTESIA_API_KEY`, and the "Allow microphone" consent
+  in setup (which turns on Cartesia for EyeMouse only).
+- **Gaze keyboard:** a dark panel along the bottom of the screen. It never takes focus, so it
+  types into whatever app you were in. Look at a key and double blink; word suggestions
+  complete the current word; Send presses Return.
+
+EyeMouse's choices live in `~/.config/opengaze/eyemouse.json`; calibrations are shared with
+the other commands. Run from a terminal, macOS grants camera and Accessibility to *that
+terminal app*, and the setup pages name it.
+
 ### Main command — gaze test environment
 
 ```bash
@@ -142,11 +175,10 @@ If no calibration exists for your hardware, the calibration wizard runs automati
 | `R` | Recenter head heading (IMU) |
 | `K` | Open gaze keyboard |
 | `G` | Open target practice game |
-| `Tab` | Toggle real cursor control on/off (OFF by default — verify tracking first) |
 | `D` | Debug overlay: every pipeline stage's health, and why the cursor isn't moving |
 | `T` | Start / stop a trace (`opengaze trace-report`) |
 | `P` | Open Accessibility settings (when the cursor-permission error shows) |
-| `Space` | Pause / resume tracking |
+| `Space` | Pause / resume cursor control (also `Tab` or a long right wink). Starts paused — verify tracking first. Tracking keeps running while paused |
 | `Esc` | Quit |
 
 ---
@@ -352,12 +384,12 @@ Cursor control is **off by default** so you can verify tracking quality before u
 1. Run `opengaze run` and calibrate if prompted
 2. Watch the cyan crosshair — confirm it tracks where you're actually looking
 3. Press **G** (practice game) to verify blink clicks fire where you intend
-4. Press **Tab** to enable cursor control — the top-right indicator turns green
+4. Press **Space** to resume cursor control — the top-right indicator turns green
 5. Grant Accessibility permission (required for cursor movement). If it's missing, the window
    shows a red **Cursor control unavailable** banner with the fix; `opengaze cursor-test`
    checks it on its own
 
-To disable at any time: press **Tab** again, or press **Esc** to quit entirely.
+To pause at any time: press **Space** again, hold a right wink, or press **Esc** to quit entirely.
 
 ## Adaptive calibration
 
@@ -557,15 +589,13 @@ The default mouse bindings work like a two-button mouse:
 | long right wink | pause / resume |
 
 While a left wink holds the button, the cursor follows the open eye. The other eye's natural
-blinks don't end the hold or count as a double blink. Pausing, turning cursor control off,
-calibrating or quitting always releases the button. `{mouse: hold}` only works on the
+blinks don't end the hold or count as a double blink. Pausing, calibrating or quitting always releases the button. `{mouse: hold}` only works on the
 `hold_wink_*` gestures, because only they report when the hold ends.
 
 Bind them under `gestures.bindings` in `configs/default.yaml`. Each binding is a system
 keystroke (`{key: "cmd+shift+tab"}`), a mouse action at the gaze point (`{mouse: right_click}`,
-`scroll_down`, …) or an OpenGaze action (`{app: pause}`, `toggle_cursor`, `recalibrate`, …).
-Key and mouse bindings only fire while cursor control is on (Tab, or a gesture bound to
-`toggle_cursor`). App bindings always fire, so the user can get back control hands-free.
+`scroll_down`, …) or an OpenGaze action (`{app: pause}`, `recalibrate`, …; `toggle_cursor` is the same as `pause`).
+Key and mouse bindings only fire while not paused. App bindings always fire, so the user can get back control hands-free.
 The test environment shows each gesture as it fires.
 
 ## Adding or changing hardware

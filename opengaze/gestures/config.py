@@ -42,6 +42,9 @@ class WinkSettings(_Model):
     # During a hold the other eye may close this long (a natural blink) without ending it.
     hold_blink_tolerance_ms: float = Field(default=350.0, ge=0.0)
     cooldown_ms: float = Field(default=600.0, ge=0.0)
+    # After a long wink (pause / resume), no long wink of either eye counts for this long, so
+    # pausing can't be undone by the next wink straight away. Time held during it doesn't count.
+    long_wink_cooldown_ms: float = Field(default=1500.0, ge=0.0)
 
     @model_validator(mode="after")
     def _ordered(self) -> WinkSettings:
@@ -81,7 +84,7 @@ MouseAction = Literal[
     "scroll_right",
 ]
 AppAction = Literal[
-    "pause", "toggle_cursor", "recalibrate", "recenter", "keyboard", "practice", "quit"
+    "pause", "toggle_cursor", "recalibrate", "recenter", "keyboard", "practice", "dictate", "quit"
 ]
 
 

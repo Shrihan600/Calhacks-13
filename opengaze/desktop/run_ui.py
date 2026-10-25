@@ -9,12 +9,12 @@ Flow
 3. Gaze dot tracks eye position.
 4. Eye gestures (blinks, winks, glances) fire their keybinds from ``gestures:`` in the app
    config; the default binds a double blink to a left click.
-5. Tab toggles real cursor control on/off (key/mouse bindings only act while it's on).
+5. Space (or Tab, or a long right wink) pauses/resumes: while paused the real cursor isn't
+   driven and key/mouse bindings don't act. Starts paused.
 6. C re-runs calibration; A runs adaptive calibration (dots until accurate).
-7. Space pauses/resumes.
-8. D shows the pipeline debug overlay: every stage's health over the last 3 s, and why the
+7. D shows the pipeline debug overlay: every stage's health over the last 3 s, and why the
    cursor isn't moving when it isn't. T starts/stops a trace (``opengaze trace-report``).
-9. Escape quits.
+8. Escape quits.
 
 ``--trace`` records a trace from the start; ``--record-video`` also saves what each camera
 gave the tracker, so the session can be re-run offline (``opengaze replay``).
@@ -109,7 +109,7 @@ class GazeTestWindow(QWidget):
         self._cursor, self._cursor_problem = _try_make_cursor()
         if self._cursor_problem:
             print(f"ERROR: cursor control unavailable — {self._cursor_problem}")
-        self._cursor_enabled = False  # off by default — toggle with Tab
+        self._cursor_enabled = False  # paused by default — toggle with Space
         self._ticks = 0
         self._error_flash_until = 0.0
         self._banner_bottom = 0
@@ -117,7 +117,8 @@ class GazeTestWindow(QWidget):
             config.gestures.bindings,
             self._cursor,
             {
-                "pause": self._toggle_pause,
+                # Pausing and turning cursor control off are the same thing.
+                "pause": self._toggle_cursor,
                 "toggle_cursor": self._toggle_cursor,
                 "recalibrate": lambda: QTimer.singleShot(0, self._run_calibration),
                 "recenter": self._recenter,
@@ -136,11 +137,10 @@ class GazeTestWindow(QWidget):
         self._left_blink = False
         self._right_blink = False
         self._blink_progress: float = 0.0
-        self._paused = False
         self._click_flash_until: float = 0.0
         self._camera_frame: np.ndarray | None = None
         self._clicks = 0
-        self._status = "Press C to calibrate, Tab to enable cursor, Space to pause, Esc to quit"
+        self._status = "Press C to calibrate, Space to start/pause the cursor, Esc to quit"
 
         # Debugging: overlay, trace, session recording
         self._debug = False
@@ -190,14 +190,6 @@ class GazeTestWindow(QWidget):
             self._retry_cursor()
         # A held wink holds the button down: keep tracking the open eye so it drags.
         self._loop.track_one_eye = self._button_held()
-        if self._paused:
-            # Keep gestures alive so an app binding (e.g. pause) can un-pause hands-free.
-            state = self._loop.tick(self.runtime.manager, t)
-            self._observe(state, t, self._cursor_tick(None, "paused"))
-            self._handle_gestures(state)
-            self.update()
-            return
-
         state = self._loop.tick(self.runtime.manager, t)
         frame = state.frame
         self._camera_frame = _preview(frame)
@@ -286,7 +278,7 @@ class GazeTestWindow(QWidget):
     def _handle_gestures(self, state) -> None:
         """Dispatch gesture events at the frozen pre-blink gaze position."""
         self._dispatcher.system_input_enabled = (
-            self._cursor_enabled and not self._paused and self._model is not None
+            self._cursor_enabled and self._model is not None
         )
         gaze_px = self._cursor.norm_to_px(self._gaze_x, self._gaze_y) if self._cursor else None
         for event in state.gesture.events:
@@ -322,12 +314,6 @@ class GazeTestWindow(QWidget):
             self._cursor.release()  # type: ignore[union-attr]
             self._event("button released")
 
-    def _toggle_pause(self) -> None:
-        self._paused = not self._paused
-        self._release_button()
-        self._loop.reset()
-        self._event("paused" if self._paused else "resumed")
-
     def _retry_cursor(self) -> bool:
         """Try again to get a cursor driver (permission may have been granted meanwhile)."""
         if self._cursor is not None:
@@ -337,21 +323,22 @@ class GazeTestWindow(QWidget):
             return False
         self._dispatcher.backend = self._cursor
         self._sync_display()
-        self._status = "Accessibility permission granted — cursor control available (Tab)"
+        self._status = "Accessibility permission granted — cursor control available (Space)"
         self._event("cursor driver available")
         return True
 
     def _toggle_cursor(self) -> None:
         if not self._cursor_enabled and not self._retry_cursor():
-            self._status = "Can't turn cursor control on — see the error above"
+            self._status = "Can't resume cursor control — see the error above"
             self._error_flash_until = time.monotonic() + 1.0
             return
         self._cursor_enabled = not self._cursor_enabled
         if not self._cursor_enabled:
             self._release_button()
+        self._loop.reset()
         self._sync_display()
-        self._status = f"Cursor control {'ON' if self._cursor_enabled else 'OFF'}"
-        self._event(f"cursor {'on' if self._cursor_enabled else 'off'}")
+        self._status = "Cursor control ON" if self._cursor_enabled else "Paused"
+        self._event("resumed" if self._cursor_enabled else "paused")
 
     def _open_permission_settings(self) -> None:
         try:
@@ -380,9 +367,7 @@ class GazeTestWindow(QWidget):
         k = event.key()
         if k == Qt.Key.Key_Escape:
             self.close()
-        elif k == Qt.Key.Key_Space:
-            self._toggle_pause()
-        elif k == Qt.Key.Key_Tab:
+        elif k in (Qt.Key.Key_Space, Qt.Key.Key_Tab):
             self._toggle_cursor()
         elif k == Qt.Key.Key_C:
             self._run_calibration()
@@ -465,14 +450,6 @@ class GazeTestWindow(QWidget):
         w, h = self.width(), self.height()
         p.fillRect(self.rect(), _BG)
 
-        if self._paused:
-            self._draw_centered(p, "PAUSED — press Space to resume", w // 2, h // 2)
-            if time.monotonic() < self._last_gesture_until:
-                p.setPen(QColor("#f0b429"))
-                p.drawText(16, 52, f"gesture: {self._last_gesture}")
-            p.end()
-            return
-
         self._draw_truth(p, w, h)
         self._draw_gaze(p, w, h)
         self._draw_camera_preview(p, w, h)
@@ -537,8 +514,7 @@ class GazeTestWindow(QWidget):
         blocked = cur.get("blocked")
         why = {
             "no_backend": "no cursor driver (Accessibility permission?)",
-            "cursor_off": "cursor control is off (Tab)",
-            "paused": "paused (Space)",
+            "cursor_off": "paused (Space)",
         }.get(blocked or "", blocked)
         p.setPen(_STATUS_COLORS["ok" if not blocked else "warn"])
         p.drawText(x0, y + 6, "cursor: moving" if not blocked else f"cursor not moving: {why}")
@@ -627,7 +603,7 @@ class GazeTestWindow(QWidget):
         elif self._cursor_enabled:
             cursor_color, cursor_state = _CURSOR_ON, "CURSOR ON"
         else:
-            cursor_color, cursor_state = _CURSOR_OFF, "CURSOR OFF (Tab)"
+            cursor_color, cursor_state = _CURSOR_OFF, "PAUSED (Space)"
 
         # Top bar
         p.drawText(16, 28,
@@ -641,8 +617,8 @@ class GazeTestWindow(QWidget):
         # Bottom bar
         p.drawText(
             16, h - 16,
-            "C=calibrate  A=adaptive  R=recenter  K=keyboard  G=practice  Tab=cursor  "
-            "D=debug  T=trace  Space=pause  Esc=quit",
+            "C=calibrate  A=adaptive  R=recenter  K=keyboard  G=practice  "
+            "D=debug  T=trace  Space=pause/resume  Esc=quit",
         )
         p.setPen(QColor("#f0b429"))
         p.drawText(16, h - 36, self._status)

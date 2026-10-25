@@ -17,6 +17,8 @@ import logging
 import signal
 import sys
 import time
+from collections.abc import Callable, Mapping
+from typing import Literal
 
 from PySide6.QtCore import QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
@@ -35,6 +37,8 @@ from opengaze.desktop.run_ui import ensure_calibration
 from opengaze.gaze.loop import GazeLoop
 from opengaze.gaze.tracker import GazeTracker
 from opengaze.gestures.bindings import ActionDispatcher
+from opengaze.gestures.config import Binding
+from opengaze.gestures.types import Gesture
 from opengaze.modes import profile_schema
 from opengaze.voice.service import VoiceService
 
@@ -48,9 +52,21 @@ _PAD = _R + 8    # repaint margin
 # Show "face not found" only after this long, so ordinary blinks don't flicker it.
 _NO_FACE_WARN_S = 1.0
 
+GazeStatus = Literal["tracking", "no_face", "mouse", "paused"]
+
 
 class GazeCursorOverlay(QWidget):
-    """Transparent, click-through, full-screen layer that also runs the gaze loop."""
+    """Transparent, click-through, full-screen layer that also runs the gaze loop.
+
+    ``app_handlers`` adds to (or replaces) the built-in ``app:`` gesture actions and
+    ``bindings`` replaces the config's gesture bindings; subclasses restyle it through the
+    class attributes below.
+    """
+
+    ring_color = _RING
+    flash_color = _FLASH
+    warn_color = _WARN
+    notes = {"no_face": "👁 face not found — look at the screen", "mouse": "🖱 mouse in control"}
 
     def __init__(
         self,
@@ -58,6 +74,9 @@ class GazeCursorOverlay(QWidget):
         loop: GazeLoop,
         cursor: QuartzCursorDriver,
         config: AppConfig,
+        *,
+        app_handlers: Mapping[str, Callable[[], None]] | None = None,
+        bindings: Mapping[Gesture, Binding] | None = None,
     ) -> None:
         super().__init__(
             None,
@@ -81,13 +100,14 @@ class GazeCursorOverlay(QWidget):
         self._cursor = cursor
         self._override = UserOverride()
         self._dispatcher = ActionDispatcher(
-            config.gestures.bindings,
+            config.gestures.bindings if bindings is None else bindings,
             cursor,
             {
                 "pause": self.toggle,
                 "toggle_cursor": self.toggle,
                 "recenter": loop.tracker.recenter,
                 "quit": QApplication.quit,
+                **(app_handlers or {}),
             },
         )
         self.enabled = True
@@ -103,6 +123,18 @@ class GazeCursorOverlay(QWidget):
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
+
+    @property
+    def status(self) -> GazeStatus:
+        if not self.enabled:
+            return "paused"
+        if time.monotonic() - self._last_face > _NO_FACE_WARN_S:
+            return "no_face"
+        return "mouse" if self._mouse_hold else "tracking"
+
+    @property
+    def confidence(self) -> float:
+        return self._loop.confidence
 
     def toggle(self) -> None:
         self.enabled = not self.enabled
@@ -129,7 +161,8 @@ class GazeCursorOverlay(QWidget):
         if frame.left_closed is not None or frame.right_closed is not None:
             self._last_face = t
 
-        allowed = self.enabled and self._override.gaze_allowed(self._cursor.position(), t)
+        cursor_pos = self._cursor.position()
+        allowed = self.enabled and self._override.gaze_allowed(cursor_pos, t)
         self._mouse_hold = self.enabled and not allowed
         if self._mouse_hold:
             self._release_button()
@@ -147,10 +180,15 @@ class GazeCursorOverlay(QWidget):
                 self._override.moved_to(px, py)
                 self._flash_until = t + 0.3
 
-        self._progress = (
-            max(state.gesture.blink_progress, state.gesture.wink_progress) if allowed else 0.0
-        )
-        self._pos = self.mapFromGlobal(QPoint(px, py))
+        if allowed:
+            self._progress = max(state.gesture.blink_progress, state.gesture.wink_progress)
+        elif not self.enabled:  # paused: only the wink that resumes
+            self._progress = state.gesture.pause_progress
+        else:
+            self._progress = 0.0
+        # Paused, the gaze point isn't shown: the resume ring sits on the real cursor.
+        ring_x, ring_y = (px, py) if self.enabled else cursor_pos
+        self._pos = self.mapFromGlobal(QPoint(ring_x, ring_y))
         self._repaint_dirty()
 
     def _repaint_dirty(self) -> None:
@@ -161,33 +199,32 @@ class GazeCursorOverlay(QWidget):
         self._painted = ring
 
     def paintEvent(self, event) -> None:  # noqa: N802
-        if not self.enabled:
+        if not self.enabled and self._progress <= 0:
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         cx, cy = self._pos.x(), self._pos.y()
         p.setBrush(Qt.BrushStyle.NoBrush)
         if time.monotonic() < self._flash_until:
-            p.setPen(QPen(_FLASH, 4))
+            p.setPen(QPen(self.flash_color, 4))
             p.drawEllipse(QPoint(cx, cy), _R, _R)
         elif self._progress > 0:
-            pen = QPen(_RING, 4)
+            pen = QPen(self.ring_color, 4)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             p.setPen(pen)
             p.drawArc(cx - _R, cy - _R, _R * 2, _R * 2,
                       90 * 16, int(-self._progress * 360 * 16))
 
-        note = ""
-        if time.monotonic() - self._last_face > _NO_FACE_WARN_S:
-            note = "👁 face not found — look at the screen"
-        elif self._mouse_hold:
-            note = "🖱 mouse in control"
+        note = self.notes.get(self.status, "")
         if note:
-            p.setFont(QFont("Helvetica Neue", 13))
-            p.setPen(_WARN)
+            p.setFont(self.note_font())
+            p.setPen(self.warn_color)
             p.drawText(QRect(self.width() - 350, 30, 340, 24),
                        Qt.AlignmentFlag.AlignRight, note)
         p.end()
+
+    def note_font(self) -> QFont:
+        return QFont("Helvetica Neue", 13)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._timer.stop()

@@ -106,6 +106,20 @@ class TestWinks:
         frames = [(0.3, False, None, 0.5, 0.5), (0.35, True, None, None, None)]
         assert Gesture.WINK_LEFT not in run(GestureRecognizer(), frames)
 
+    def test_pause_progress_only_for_the_wink_bound_to_pause(self):
+        rec = GestureRecognizer(GestureSettings(
+            bindings={Gesture.LONG_WINK_RIGHT: Binding(app="pause")}
+        ))
+        rec.update(EyeSignal(0.0, False, False, 0.5, 0.5))
+        rec.update(EyeSignal(0.1, False, True, None, None))  # right wink starts
+        assert rec.update(EyeSignal(0.5, False, True, None, None)).pause_progress == (
+            pytest.approx(0.5)
+        )
+        rec.update(EyeSignal(0.6, False, False, 0.5, 0.5))
+        rec.update(EyeSignal(1.5, True, False, None, None))  # left wink: unbound
+        frame = rec.update(EyeSignal(1.9, True, False, None, None))
+        assert frame.pause_progress == 0.0 and frame.wink_progress > 0
+
 
 def events(rec: GestureRecognizer, frames: list[tuple]) -> list[GestureEvent]:
     t = 0.0
@@ -120,6 +134,34 @@ def events(rec: GestureRecognizer, frames: list[tuple]) -> list[GestureEvent]:
 
 LEFT_SHUT = (True, False, 0.5, 0.5)
 BOTH_SHUT = (True, True, None, None)
+
+
+class TestLongWinkCooldown:
+    def test_second_long_wink_waits_for_cooldown(self):
+        wink = eyes(0.9, LEFT_SHUT)
+        frames = [eyes(0.3, OPEN), wink, eyes(0.3, OPEN), wink, eyes(0.3, OPEN)]
+        got = [e.gesture for e in events(GestureRecognizer(), frames)]
+        assert got.count(Gesture.LONG_WINK_LEFT) == 1
+
+    def test_long_wink_after_cooldown(self):
+        wink = eyes(0.9, LEFT_SHUT)
+        frames = [eyes(0.3, OPEN), wink, eyes(1.6, OPEN), wink, eyes(0.3, OPEN)]
+        got = [e.gesture for e in events(GestureRecognizer(), frames)]
+        assert got.count(Gesture.LONG_WINK_LEFT) == 2
+
+    def test_wink_held_through_a_reset_does_not_fire_again(self):
+        # Pausing resets the recognizer while the eye is still shut from the pausing wink.
+        rec = GestureRecognizer()
+        t, fired = 0.0, []
+        while t < 6.0:
+            closed = 0.3 <= t < 5.0
+            frame = rec.update(EyeSignal(t, closed, False, 0.5, 0.5))
+            for e in frame.events:
+                if e.gesture is Gesture.LONG_WINK_LEFT:
+                    fired.append(e)
+                    rec.reset()
+            t += DT
+        assert len(fired) == 1
 
 
 class TestWinkRunsAndHolds:

@@ -15,6 +15,9 @@ import time
 # CGEventKeyboardSetUnicodeString is truncated beyond ~20 UTF-16 units per event.
 _CHUNK = 20
 _KEY_C = 8
+# Virtual key codes for the keys the gaze keyboard sends as real key presses.
+KEY_DELETE = 51
+KEY_RETURN = 36
 
 
 def _utf16_len(s: str) -> int:
@@ -59,6 +62,13 @@ def _press(keycode: int, flags: int = 0) -> None:
         ev = Q.CGEventCreateKeyboardEvent(src, keycode, down)
         Q.CGEventSetFlags(ev, flags)
         Q.CGEventPost(Q.kCGHIDEventTap, ev)
+
+
+def tap_key(keycode: int) -> None:
+    """Press and release one key (e.g. ``KEY_DELETE``) in the focused app."""
+    if sys.platform != "darwin":
+        raise RuntimeError("system-wide typing is macOS-only")
+    _press(keycode)
 
 
 def copy_selection(timeout_s: float = 0.5) -> str:
@@ -114,10 +124,9 @@ class FocusTracker:
         """Bring the remembered app back to the front. True if focus had to move."""
         import AppKit
 
-        front = self._ws.frontmostApplication()
-        if self.last is None or (
-            front is not None and front.processIdentifier() != self._own_pid
-        ):
+        # NSApp.isActive, not frontmostApplication: the latter only catches up once the run
+        # loop turns, so right after a click activated us it still names the other app.
+        if self.last is None or not AppKit.NSApplication.sharedApplication().isActive():
             return False
         self.last.activateWithOptions_(AppKit.NSApplicationActivateIgnoringOtherApps)
         end = time.monotonic() + 0.5

@@ -43,6 +43,18 @@ _MODEL_URL = (
 _BLINK_MP_LEFT = "eyeBlinkLeft"
 _BLINK_MP_RIGHT = "eyeBlinkRight"
 _BLINK_THRESHOLD = 0.4  # blendshape score above this counts as a blink
+# During a wink the open eye's score rises too (the cheek squints it, and the model couples
+# the eyes), often past the threshold, which turns every wink into a blink. An eye counts as
+# open while the other eye's score is at least this much higher.
+_WINK_MARGIN = 0.25
+
+
+def closed_from_scores(left: float, right: float) -> tuple[bool, bool]:
+    """(left closed, right closed) from the two eyes' blink scores (0 = open, 1 = closed)."""
+    return (
+        left > _BLINK_THRESHOLD and right - left < _WINK_MARGIN,
+        right > _BLINK_THRESHOLD and left - right < _WINK_MARGIN,
+    )
 
 
 def default_model_path() -> Path:
@@ -201,6 +213,9 @@ def _parse_result(
     iod = float(np.hypot(outer_l.x - outer_r.x, outer_l.y - outer_r.y))
     pupil_radius = iod * 0.07  # iris ≈ 7% of the eye-corner span (heuristic)
 
+    closed_l, closed_r = closed_from_scores(blink_mp["left"], blink_mp["right"])
+    closed_mp = {"left": closed_l, "right": closed_r}
+
     eyes = []
     for side, (iris_idx, mp_side) in user_eyes.items():
         iris = landmarks[iris_idx]
@@ -217,7 +232,7 @@ def _parse_result(
                 pupil_x_norm=float(iris.x),
                 pupil_y_norm=float(iris.y),
                 pupil_radius_norm=pupil_radius,
-                blink=score > _BLINK_THRESHOLD,
+                blink=closed_mp[mp_side],
                 confidence=max(0.0, 1.0 - score),
                 detector="mediapipe_face_landmarker",
                 gaze_in_head=gaze,

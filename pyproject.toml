@@ -42,9 +42,13 @@ all = ["opengaze[desktop,tracking,imu,api,dev]"]
 
 [project.scripts]
 opengaze = "opengaze.cli:main"
+eyemouse = "opengaze.cli:eyemouse_main"
 
 [tool.setuptools.packages.find]
 include = ["opengaze*"]
+
+[tool.setuptools.package-data]
+"opengaze.consumer" = ["fonts/*.ttf", "fonts/*.txt", "assets/*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

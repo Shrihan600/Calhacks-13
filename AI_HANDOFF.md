@@ -17,6 +17,24 @@ Read this, then [`PROJECT_STATUS.md`](PROJECT_STATUS.md), then
 - **Clicking is a double blink (left click).** No dwell clicking and no long-blink click,
   even though the hardware handoff lists dwell. This was decided on 2026-10-24.
 
+## EyeMouse, the consumer app (2026-10-25)
+
+`opengaze app` (`opengaze/consumer/`) is the end-user app built from the "EyeMouse — consumer
+app" Claude Design canvas. It is UI only, over the existing pipeline:
+
+- `engine.py`: one `GazeEngine` owns the camera runtime and runs `desktop_mode`'s
+  `GazeCursorOverlay` (restyled subclass). Calibration stops the cursor (both would call
+  `tracker.step`). The consumer binds triple blink to `app: dictate`.
+- `calibration.py`: `CalibrationWindow` subclass; only painting and the end of the flow change.
+- `setup_window.py`, `practice.py`, `art.py`: the setup pages. Practice uses real mouse events,
+  so it works with gaze gestures and with a helper's mouse alike.
+- `menubar.py`, `voice_typing.py`, `keyboard.py`, `settings_window.py`, `app.py` (controller).
+- `opengaze/control/ax.py`: Accessibility API through ctypes (PyObjC's ApplicationServices
+  isn't a dependency): the permission prompt and the focused text caret's bounds.
+- Fonts (Fredoka, Figtree; OFL) ship in `opengaze/consumer/fonts/`.
+- `float_everywhere` now no-ops off the Cocoa platform, so floating windows can be tested
+  offscreen.
+
 ## How the handoff's suggested module layout maps onto this codebase
 
 The hardware team suggested `opengaze/hardware/{left_camera,right_camera,imu_receiver,

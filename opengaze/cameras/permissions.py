@@ -1,4 +1,4 @@
-"""macOS camera permission.
+"""macOS camera (and microphone) permission.
 
 OpenCV can only show the macOS camera prompt from the main thread, but OpenGaze opens cameras
 on per-camera worker threads. So the app asks for permission itself, on the main thread,
@@ -43,17 +43,27 @@ GUIDANCE = {
 }
 
 
-def camera_permission_status() -> CameraPermission:
+def _media_status(media_type: str) -> CameraPermission:
     if sys.platform != "darwin":
         return CameraPermission.UNAVAILABLE
     try:
-        from AVFoundation import AVCaptureDevice, AVMediaTypeVideo
+        import AVFoundation
     except ImportError:
         return CameraPermission.UNAVAILABLE
     return _STATUS.get(
-        int(AVCaptureDevice.authorizationStatusForMediaType_(AVMediaTypeVideo)),
+        int(AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(
+            getattr(AVFoundation, media_type)
+        )),
         CameraPermission.UNAVAILABLE,
     )
+
+
+def camera_permission_status() -> CameraPermission:
+    return _media_status("AVMediaTypeVideo")
+
+
+def microphone_permission_status() -> CameraPermission:
+    return _media_status("AVMediaTypeAudio")
 
 
 def request_camera_permission(timeout_s: float = 120.0) -> CameraPermission:
@@ -62,20 +72,29 @@ def request_camera_permission(timeout_s: float = 120.0) -> CameraPermission:
     Must run on the main thread: it pumps the main run loop while the prompt is up.
     Returns the resulting status without prompting when it's already decided.
     """
-    status = camera_permission_status()
+    return _request_access(camera_permission_status, "AVMediaTypeVideo", timeout_s)
+
+
+def request_microphone_permission(timeout_s: float = 120.0) -> CameraPermission:
+    """Like ``request_camera_permission``, for the microphone (voice typing)."""
+    return _request_access(microphone_permission_status, "AVMediaTypeAudio", timeout_s)
+
+
+def _request_access(status_fn, media_type: str, timeout_s: float) -> CameraPermission:
+    status = status_fn()
     if status is not CameraPermission.NOT_DETERMINED:
         return status
     if threading.current_thread() is not threading.main_thread():
-        raise RuntimeError("request_camera_permission() must be called on the main thread")
-    from AVFoundation import AVCaptureDevice, AVMediaTypeVideo
+        raise RuntimeError("permission requests must be made on the main thread")
+    import AVFoundation
     from Foundation import NSDate, NSRunLoop
 
     answered = threading.Event()
-    AVCaptureDevice.requestAccessForMediaType_completionHandler_(
-        AVMediaTypeVideo, lambda granted: answered.set()
+    AVFoundation.AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+        getattr(AVFoundation, media_type), lambda granted: answered.set()
     )
     deadline = time.monotonic() + timeout_s
     run_loop = NSRunLoop.currentRunLoop()
     while not answered.is_set() and time.monotonic() < deadline:
         run_loop.runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
-    return camera_permission_status()
+    return status_fn()

@@ -33,7 +33,7 @@ privacy:
 #   key:   a system keystroke, e.g. "cmd+shift+tab", "page_down", "alt+left"
 #   mouse: click | right_click | double_click | middle_click | scroll_up/down/left/right
 #          (at the gaze position)
-#   app:   pause | toggle_cursor | recalibrate | keyboard | practice | quit
+#   app:   pause | toggle_cursor | recalibrate | keyboard | practice | dictate | quit
 # key/mouse bindings only fire while cursor control is ON; app bindings always fire.
 # Winks need both eyes observed (Mode A or C). Glances need a calibration.
 gestures:
@@ -47,6 +47,7 @@ gestures:
     long_wink_ms: 800
     hold_press_ms: 300       # a held wink presses the button after this long (drag)
     multi_wink_gap_ms: 500   # winks this close together count as double/triple
+    long_wink_cooldown_ms: 1500  # after a long wink (pause/resume), the next needs this gap
   glance:
     edge_margin: 0.02        # how far past the screen edge counts (normalised screen units)
     max_glance_ms: 700
@@ -54,13 +55,10 @@ gestures:
     hold_repeat_ms: 350      # holds repeat while held (null = fire once)
   bindings:
     double_blink: {mouse: click}          # left click (no dwell or long-blink click)
-    triple_blink: {app: toggle_cursor}
     # Left eye = left button held: wink and hold to press, look to drag, reopen to release.
     hold_wink_left: {mouse: hold}
     # Right eye = right button. Two quick winks = a double right-click.
     wink_right: {mouse: right_click}
     long_wink_right: {app: pause}         # hands-free stop / resume
-    glance_left: {key: "cmd+["}
-    glance_right: {key: "cmd+]"}
     hold_up: {mouse: scroll_up}
     hold_down: {mouse: scroll_down}

@@ -17,6 +17,8 @@ class GestureFrame:
     wink_progress: float  # 0 → 1 toward a long wink
     hold_progress: float  # 0 → 1 toward an edge hold
     glance_zone: str | None  # edge currently looked past, if any
+    # 0 → 1 toward a long wink bound to pause (it also resumes), shown while paused
+    pause_progress: float = 0.0
 
 
 class GestureRecognizer:
@@ -66,7 +68,18 @@ class GestureRecognizer:
             wink_progress=self.wink.progress(sig.t),
             hold_progress=self.glance.progress(sig.t),
             glance_zone=self.glance.zone,
+            pause_progress=self._pause_progress(sig.t),
         )
+
+    def _pause_progress(self, t: float) -> float:
+        eye = self.wink.eye
+        if eye is None:
+            return 0.0
+        g = Gesture.LONG_WINK_LEFT if eye == "left" else Gesture.LONG_WINK_RIGHT
+        binding = self.settings.bindings.get(g)
+        if binding is None or binding.app not in ("pause", "toggle_cursor"):
+            return 0.0
+        return self.wink.progress(t)
 
     def reset(self) -> None:
         self.blink.reset()

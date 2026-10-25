@@ -27,7 +27,14 @@ from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from opengaze.control.cursor import is_accessibility_granted, open_accessibility_prefs
 from opengaze.control.keystrokes import FocusTracker, copy_selection, set_clipboard, type_text
-from opengaze.desktop.macwin import become_accessory_app, float_everywhere
+from opengaze.desktop.macwin import (
+    KEY_D,
+    KEY_G,
+    KEY_S,
+    CtrlOptHotkeys,
+    become_accessory_app,
+    float_everywhere,
+)
 from opengaze.voice.service import VoiceService, VoiceState
 
 log = logging.getLogger("opengaze.dictation_ui")
@@ -44,10 +51,6 @@ _SPEAKING = QColor("#2e9e5b")
 _TEXT     = QColor("#e8e8e8")
 _DIM      = QColor("#7a8499")
 _ACCENT   = QColor("#00d4ff")
-
-# NSEvent modifier flags and key codes (US layout positions).
-_CTRL, _OPT, _CMD = 1 << 18, 1 << 19, 1 << 20
-_KEY_D, _KEY_S, _KEY_G = 2, 1, 5
 
 
 class GazeSwitch(Protocol):
@@ -80,7 +83,11 @@ class DictationBar(QWidget):
         self._note_until = 0.0
         self._last_heard = ""
         self._drag_from: QPoint | None = None
-        self._monitors: list[object] = []
+        self._hotkeys = CtrlOptHotkeys({
+            KEY_D: lambda: self._trigger("dictate"),
+            KEY_S: lambda: self._trigger("speak"),
+            KEY_G: lambda: self._trigger("gaze"),
+        })
 
         top = (_H - _BTN) // 2
         self._mic_rect = QRect(12, top, _BTN, _BTN)
@@ -108,40 +115,7 @@ class DictationBar(QWidget):
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
         float_everywhere(self)
-        if not self._monitors:
-            self._install_hotkeys()
-
-    def _install_hotkeys(self) -> None:
-        try:
-            import AppKit
-        except ImportError:
-            return
-
-        def matches(ev) -> str | None:
-            flags = int(ev.modifierFlags())
-            if flags & _CTRL and flags & _OPT and not flags & _CMD:
-                return {_KEY_D: "dictate", _KEY_S: "speak", _KEY_G: "gaze"}.get(
-                    int(ev.keyCode())
-                )
-            return None
-
-        def on_global(ev) -> None:
-            action = matches(ev)
-            if action:
-                self._trigger(action)
-
-        def on_local(ev):
-            action = matches(ev)
-            if action:
-                self._trigger(action)
-                return None
-            return ev
-
-        mask = AppKit.NSEventMaskKeyDown
-        self._monitors = [
-            AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(mask, on_global),
-            AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(mask, on_local),
-        ]
+        self._hotkeys.install()
 
     # ------------------------------------------------------------------
     # Actions
@@ -279,14 +253,7 @@ class DictationBar(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._timer.stop()
-        try:
-            import AppKit
-
-            for m in self._monitors:
-                AppKit.NSEvent.removeMonitor_(m)
-        except Exception:
-            pass
-        self._monitors = []
+        self._hotkeys.remove()
         self._voice.shutdown()
         super().closeEvent(event)
 

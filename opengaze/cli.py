@@ -449,6 +449,31 @@ def cmd_desktop(args: argparse.Namespace) -> int:
     return run_desktop_mode(report, config, voice)
 
 
+def cmd_app(args: argparse.Namespace) -> int:
+    """EyeMouse, the consumer app: guided setup, then gaze control from the menu bar."""
+    config, report = _load(args)
+    if not report.ok:
+        _print_report(report)
+        return 1
+    if sys.platform != "darwin":
+        print("EyeMouse is macOS-only")
+        return 1
+    try:
+        from opengaze.consumer.app import run_app
+    except ImportError as exc:
+        print(f"desktop UI unavailable ({exc}); install with: pip install -e '.[all]'")
+        return 1
+    # A login item restarts the app with the same profile choices.
+    login_args = ["--config", str(Path(args.config).resolve())]
+    if args.profile:
+        login_args += ["--profile", str(Path(args.profile).resolve())]
+    for overlay in args.overlay:
+        login_args += ["--overlay", str(Path(overlay).resolve())]
+    for item in args.set:
+        login_args += ["--set", item]
+    return run_app(report, config, force_setup=args.setup, login_args=login_args)
+
+
 def cmd_calibrate(args: argparse.Namespace) -> int:
     config, report = _load(args)
     if not report.ok:
@@ -755,6 +780,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="opt into Cartesia voice for this session")
     p.set_defaults(func=cmd_desktop)
 
+    p = sub.add_parser("app", help="EyeMouse: guided setup, then gaze control from the menu bar")
+    add_profile_args(p)
+    p.add_argument("--setup", action="store_true", help="run setup again, even if it's done")
+    p.set_defaults(func=cmd_app)
+
     p = sub.add_parser("dictate", help="system-wide voice bar: dictate into any app (Cartesia)")
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="app config YAML")
     p.add_argument("--cloud", action="store_true",
@@ -786,6 +816,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     return int(args.func(args) or 0)
+
+
+def eyemouse_main() -> int:
+    """``eyemouse``: shorthand for ``opengaze app``."""
+    return main(["app", *sys.argv[1:]])
 
 
 if __name__ == "__main__":
