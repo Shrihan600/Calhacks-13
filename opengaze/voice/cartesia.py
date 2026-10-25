@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import ssl
 import urllib.error
 import urllib.request
 import uuid
@@ -26,6 +27,23 @@ DEFAULT_VOICE_ID = "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4"
 TTS_SAMPLE_RATE = 24000
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """System trust store, falling back to certifi when it is empty.
+
+    python.org macOS builds ship with no CA certificates until the user runs
+    "Install Certificates.command", which makes every HTTPS call fail with
+    CERTIFICATE_VERIFY_FAILED.
+    """
+    ctx = ssl.create_default_context()
+    if ctx.cert_store_stats().get("x509_ca", 0) == 0:
+        try:
+            import certifi
+        except ImportError:
+            return ctx
+        ctx.load_verify_locations(certifi.where())
+    return ctx
 
 
 class CartesiaError(RuntimeError):
@@ -143,7 +161,9 @@ class CartesiaClient:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            with urllib.request.urlopen(
+                req, timeout=self.timeout_s, context=_ssl_context(),
+            ) as resp:
                 return resp.read()
         except urllib.error.HTTPError as exc:
             raise CartesiaError(

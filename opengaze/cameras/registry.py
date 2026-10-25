@@ -9,6 +9,7 @@ from opengaze.cameras.recorded import RecordedVideoSource
 from opengaze.cameras.simulated import SyntheticCameraSource
 from opengaze.cameras.types import CameraConfigError
 from opengaze.cameras.usb import USBCameraSource
+from opengaze.cameras.wired import SerialEyeSource
 from opengaze.config.schema import CameraConfig
 
 _SOURCES: dict[str, type[CameraSource]] = {
@@ -19,6 +20,7 @@ _SOURCES: dict[str, type[CameraSource]] = {
         RecordedVideoSource,
         SyntheticCameraSource,
         ESP32StreamSource,
+        SerialEyeSource,
     )
 }
 

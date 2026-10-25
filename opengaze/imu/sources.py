@@ -8,6 +8,7 @@ own thread. Each validates its ``options`` with its own pydantic model, like cam
 | ``synthetic`` | simulated head motion with ground truth, gyro noise and bias (no hardware) |
 | ``serial``    | USB serial (Arduino / ESP32 / Pi Pico over USB), needs ``pyserial`` |
 | ``udp``       | UDP datagrams (ESP32 / Pi over Wi-Fi): text lines or JSON telemetry, stdlib only |
+| ``wired``     | MPU-6050 on the left ESP32-CAM, sharing its camera's serial port (wired mode) |
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import collections
 import dataclasses
 import json
 import math
+import os
 import socket
 import time
 from abc import ABC, abstractmethod
@@ -402,12 +404,177 @@ class UdpImuSource(ImuSource):
             self._sock = None
 
 
+# ---------------------------------------------------------------------------
+# Wired (MPU-6050 on the left ESP32-CAM, through the hardware team's receiver)
+# ---------------------------------------------------------------------------
+
+
+class WiredImuOptions(_Options):
+    # The board's serial port. null = the port of the camera configured for ``board``, so
+    # --left-serial sets both.
+    port: str | None = None
+    board: str = "left"
+    baud: int | None = Field(default=None, gt=0)  # null = the board's camera's
+    receiver_dir: str | None = None  # see opengaze.cameras.wired
+    # The receiver reports g and deg/s.
+    gyro_units: GyroUnits = "deg_s"
+    accel_units: AccelUnits = "g"
+    device_clock: bool = True
+
+
+class WiredImuSource(ImuSource):
+    """Reads the receiver's IMU buffer (``TelemetryReceiver.imu``, newest last).
+
+    The port belongs to the camera's ``WiredLink``; this only adds a user to it. Sequence
+    gaps, reordering and out-of-range readings are counted by the receiver and reported in
+    ``stats()``.
+    """
+
+    source_type: ClassVar[str] = "wired"
+    Options: ClassVar[type[BaseModel]] = WiredImuOptions
+
+    def __init__(self, options: dict[str, Any] | None = None) -> None:
+        super().__init__(options)
+        self._link: Any = None
+        self._last: Any = None  # the newest receiver sample already taken
+        self._pending: collections.deque[Any] = collections.deque()
+        self._counters = collections.Counter[str]()
+        self.last_error: str | None = None
+        self._found = False  # the port was found automatically, so it may move
+
+    def open(self) -> None:
+        from opengaze.cameras.types import CameraError
+        from opengaze.cameras.wired import AUTO_PORT, acquire_link, board_port, find_board_port
+
+        o: WiredImuOptions = self.options
+        configured = board_port(o.board)
+        port = o.port or (configured[0] if configured else None)
+        baud = o.baud or (configured[1] if configured and port == configured[0] else None)
+        if port is None:
+            raise OSError(
+                f"no serial port for the {o.board} board: set imu.options.port or "
+                f"configure the {o.board}_eye camera (--{o.board}-serial)"
+            )
+        try:
+            if port == AUTO_PORT:
+                port = find_board_port(o.board, baud, o.receiver_dir)
+                self._found = True
+            self._link = acquire_link(o.board, port, baud, o.receiver_dir)
+        except CameraError as exc:
+            raise OSError(str(exc)) from exc
+        # Start from now: the receiver's buffer holds up to ~40 s of older readings.
+        buffer = getattr(self._link.telemetry, "imu", None)
+        self._last = buffer[-1] if buffer else None
+        self._pending.clear()
+
+    def read(self, timeout_s: float) -> ImuSample | None:
+        assert self._link is not None
+        deadline = time.monotonic() + timeout_s
+        while True:
+            while self._pending:
+                sample = self._sample(self._pending.popleft())
+                if sample is not None:
+                    return sample
+            self._take_new()
+            if self._pending:
+                continue
+            if time.monotonic() >= deadline:
+                if self._found and not os.path.exists(self._link.port):
+                    # Unplugged, maybe into another socket: reopening looks for it again.
+                    raise OSError(f"{self._link.port} is gone")
+                return None
+            time.sleep(0.002)
+
+    def _take_new(self) -> None:
+        """Move samples newer than the last one taken into ``_pending``, oldest first."""
+        buffer = getattr(self._link.telemetry, "imu", None)
+        if buffer is None:
+            return
+        for _ in range(3):  # the receiver thread may append while this walks the deque
+            fresh = []
+            try:
+                for raw in reversed(buffer):
+                    if raw is self._last:
+                        break
+                    fresh.append(raw)
+            except RuntimeError:
+                continue
+            if fresh:
+                self._last = fresh[0]
+                self._pending.extend(reversed(fresh))
+            return
+
+    def _sample(self, raw: Any) -> ImuSample | None:
+        o: WiredImuOptions = self.options
+        if not _field(raw, "valid"):
+            self._counters["invalid"] += 1
+            return None
+        try:
+            accel = np.array([float(_field(raw, k)) for k in ("ax", "ay", "az")])
+            gyro = np.array([float(_field(raw, k)) for k in ("gx", "gy", "gz")])
+            device_us = int(_field(raw, "dev_us"))
+        except (TypeError, ValueError):
+            self._counters["parse_errors"] += 1
+            return None
+        if o.gyro_units == "deg_s":
+            gyro = np.radians(gyro)
+        if o.accel_units == "g":
+            accel = accel * GRAVITY
+        # The receiver stamps arrival with time.monotonic(), the same clock as monotonic_ns.
+        host_ts = _field(raw, "host_ts")
+        now = int(host_ts * 1e9) if host_ts else time.monotonic_ns()
+        capture_ns = None
+        if o.device_clock:
+            link = self._link
+            with link.clock_lock:
+                capture_ns = link.clock.update(device_us, now)
+                link.imu_seen = True
+        self._counters["samples"] += 1
+        sequence = _field(raw, "seq")
+        temperature = _field(raw, "temp_c")
+        return ImuSample(
+            now, device_us * 1e-6, gyro, accel, "live",
+            sequence=int(sequence) if sequence is not None else None,
+            device_id=f"{o.board}_esp32",
+            temperature_c=float(temperature) if temperature is not None else None,
+            capture_ns=capture_ns,
+        )
+
+    def stats(self) -> dict[str, Any]:
+        out: dict[str, Any] = dict(self._counters)
+        link = self._link
+        if link is None:
+            return out
+        out["port"] = link.port
+        out["receiver_state"] = link.state
+        # The receiver's own counters for the left device (id 1): sequence gaps, reordering,
+        # out-of-range readings, malformed packets.
+        device = getattr(link.telemetry, "dev", {}).get(1)
+        for name in ("lost", "reordered", "range_errors", "bad_packets"):
+            value = getattr(device, name, None)
+            if value:
+                out[name] = value
+        return out
+
+    def close(self) -> None:
+        if self._link is not None:
+            from opengaze.cameras.wired import release_link
+
+            release_link(self._link)
+            self._link = None
+
+
+def _field(obj: Any, name: str) -> Any:
+    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+
 def _with_capture(sample: ImuSample, capture_ns: int) -> ImuSample:
     return dataclasses.replace(sample, capture_ns=capture_ns)
 
 
 IMU_SOURCES: dict[str, type[ImuSource]] = {
-    cls.source_type: cls for cls in (SyntheticImuSource, SerialImuSource, UdpImuSource)
+    cls.source_type: cls
+    for cls in (SyntheticImuSource, SerialImuSource, UdpImuSource, WiredImuSource)
 }
 
 

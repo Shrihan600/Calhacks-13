@@ -17,6 +17,57 @@ Read this, then [`PROJECT_STATUS.md`](PROJECT_STATUS.md), then
 - **Clicking is a double blink (left click).** No dwell clicking and no long-blink click,
   even though the hardware handoff lists dwell. This was decided on 2026-10-24.
 
+## Wired eye cameras (2026-10-25)
+
+The hardware team moved the eye cameras from Wi-Fi to USB serial: one Seeed XIAO RA4M1
+bridge per ESP32-CAM (OV3660), 921600 baud, CRC-framed JPEGs, MPU-6050 now on the **left**
+board. They ship the receiver (`opengaze-hw/receiver`: `serial_client.SerialCamera`,
+`imu_client.TelemetryReceiver`). We don't reimplement the protocol:
+
+- `cameras/wired.py`: `SerialEyeSource` (`esp32_serial`) loads the receiver from
+  `options.receiver_dir`, `$OPENGAZE_HW_RECEIVER` or `opengaze-hw/receiver`.
+  One `WiredLink` per port is shared by the camera and the IMU (one program per port), is
+  reference counted, and lingers 3 s so a reconnect doesn't reopen the port. Never call
+  `TelemetryReceiver.start()` (that is the UDP listener).
+- `imu/sources.py` `WiredImuSource` (`wired`) polls `last_imu` (g, deg/s); its port defaults
+  to the left camera's.
+- Clock: the camera and the IMU on a board share one `DeviceClockSync`. IMU packets set the
+  offset, and frames are only mapped with it, so frame and IMU times stay aligned.
+- CLI: `--left-serial` / `--right-serial` expand to `--set cameras.*.options.port=…`.
+- **Port `auto`** (the profile's default): `find_board_port` runs a `GlassesScan` (every
+  `/dev/cu.usbmodem*` / `usbserial*` opened as a lingering `WiredLink`) until a link's
+  `TelemetryReceiver.dev[1|2]` has fresh packets (device id 1 = left, 2 = right; STATUS
+  comes once a second). One search at a time (`_DETECT_LOCK`); the lingering links mean the
+  camera then reuses the scan's port instead of reopening it. The auto IMU raises when its
+  port vanishes, so `ImuRuntime` reopens and searches again.
+- **EyeMouse always runs on the glasses** (`cli.GLASSES_PROFILE`), by product decision: no
+  webcam-only choice for users. `--profile configs/hardware/webcam-only.yaml` is the dev
+  fallback (no eye cameras → setup skips the glasses page). Setup's `GlassesPage` polls a
+  `GlassesScan`, shows both eyes and unlocks Continue when both boards are found; the menu
+  shows the current hardware problem.
+- **Problems are visible** (user requirement): `consumer/problems.py` `find_problem` maps
+  camera + IMU health to one `Problem` (error / warning) with user wording, keyed off the
+  manager's `last_error` text (`isn't connected` = the port search found nothing, `receiver`
+  = receiver missing). `ProblemMonitor` debounces 2 s. `EyeMouseApp.check_hardware` (1 s
+  timer) drives `WarningBanner` (errors), `MenuBar.notify` + the ⚠ menu line, and the log.
+  `cmd_app` shows a dialog for an invalid profile. Fullscreen calibration hides other
+  windows, so `EyeMouseCalibration` paints the problem itself (`paint_problem`) and blocks
+  Start on an error; the floating banner is hidden meanwhile. A failed calibration save is
+  shown on its card. `needs_setup` reruns setup when `AppSettings.setup_hardware` isn't the
+  current profile's file name. Keep those error strings in step with
+  `cameras/wired.py`; `tests/test_wired_detect.py` runs the real manager to check them.
+- The receiver lives in `opengaze-hw/` (the unzipped handoff). The adapter reads
+  `Frame.img / dev_ts_us / host_ts / frame_id` and the `TelemetryReceiver.imu` deque
+  (`ImuSample.seq / dev_us / host_ts / ax… / valid`), starting from the newest sample on open.
+- **Receiver bug, patched locally:** `SerialCamera` and `TelemetryReceiver` subclass
+  `threading.Thread` and had a `_handle` method; since Python 3.13, `Thread.__init__` sets
+  `self._handle`, so every packet raised `'_ThreadHandle' object is not callable`. Renamed to
+  `_handle_packet` in `opengaze-hw/receiver/`. `load_receiver` refuses an unpatched copy with
+  that explanation. Tell the hardware team.
+- **macOS + simulator:** pyserial sets 921600 with an ioctl that pseudo-terminals reject
+  (`Errno 25`). Against the simulator use `--set cameras.{left,right}_eye.options.baud=230400`
+  (the simulator paces itself at 921600 regardless). Real USB CDC ports are unaffected.
+
 ## EyeMouse, the consumer app (2026-10-25)
 
 `opengaze app` (`opengaze/consumer/`) is the end-user app built from the "EyeMouse — consumer

@@ -93,7 +93,7 @@ def test_wav_roundtrip():
 def test_transcribe_request_shape(monkeypatch):
     seen = {}
 
-    def fake_urlopen(req, timeout):
+    def fake_urlopen(req, timeout, context=None):
         seen["url"] = req.full_url
         seen["headers"] = dict(req.header_items())
         seen["body"] = req.data
@@ -112,7 +112,7 @@ def test_transcribe_request_shape(monkeypatch):
 def test_synthesize_request_shape(monkeypatch):
     seen = {}
 
-    def fake_urlopen(req, timeout):
+    def fake_urlopen(req, timeout, context=None):
         seen["json"] = json.loads(req.data)
         return _FakeResp(b"\x01\x00" * 10)
 
@@ -124,7 +124,7 @@ def test_synthesize_request_shape(monkeypatch):
 
 
 def test_network_error_becomes_cartesia_error(monkeypatch):
-    def boom(req, timeout):
+    def boom(req, timeout, context=None):
         raise cartesia.urllib.error.URLError("offline")
 
     monkeypatch.setattr(cartesia.urllib.request, "urlopen", boom)
@@ -233,7 +233,7 @@ def test_cancel_drops_inflight_transcript(monkeypatch):
 def test_retries_once_on_timeout(monkeypatch):
     calls = []
 
-    def flaky(req, timeout):
+    def flaky(req, timeout, context=None):
         calls.append(1)
         if len(calls) == 1:
             raise TimeoutError("stalled")
@@ -247,7 +247,7 @@ def test_retries_once_on_timeout(monkeypatch):
 def test_client_error_not_retried_and_message_parsed(monkeypatch):
     calls = []
 
-    def unauthorized(req, timeout):
+    def unauthorized(req, timeout, context=None):
         calls.append(1)
         body = json.dumps({"error_code": None, "title": "Unauthorized",
                            "message": "Invalid API key.", "request_id": "x"}).encode()

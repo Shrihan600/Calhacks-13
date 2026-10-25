@@ -10,13 +10,19 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
-from opengaze.cameras.permissions import request_camera_permission
+from opengaze.cameras.permissions import (
+    CameraPermission,
+    camera_permission_status,
+    request_camera_permission,
+)
+from opengaze.cameras.wired import GlassesScan
 from opengaze.config.loader import ProfileReport
 from opengaze.config.schema import AppConfig
 from opengaze.consumer import theme
@@ -24,10 +30,12 @@ from opengaze.consumer.calibration import EyeMouseCalibration, Outcome, run_cali
 from opengaze.consumer.engine import GazeEngine
 from opengaze.consumer.keyboard import GazeKeyboard
 from opengaze.consumer.menubar import MenuBar, MenuHooks
+from opengaze.consumer.problems import ProblemMonitor
 from opengaze.consumer.settings import AppSettings, LoginItem
 from opengaze.consumer.settings_window import SettingsHooks, SettingsWindow
 from opengaze.consumer.setup_window import SetupHooks, SetupWindow
 from opengaze.consumer.voice_typing import VoiceTyping
+from opengaze.consumer.warning_banner import WarningBanner
 from opengaze.desktop.macwin import KEY_D, KEY_G, CtrlOptHotkeys, become_accessory_app
 from opengaze.desktop.run_ui import _launching_app
 from opengaze.voice.cartesia import CartesiaConfig
@@ -36,11 +44,26 @@ from opengaze.voice.service import VoiceService
 log = logging.getLogger("opengaze.consumer")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_PROBLEM_CHECK_MS = 1000
 
 
 def _permission_app() -> str:
     """The app macOS asks about: EyeMouse when bundled, else whatever launched Python."""
     return theme.APP_NAME if ".app/Contents/" in sys.executable else _launching_app()
+
+
+def needs_setup(settings: AppSettings, report: ProfileReport, force: bool = False) -> bool:
+    """Setup runs the first time, when asked, and on glasses it wasn't done with (an earlier
+    webcam-only setup never showed the glasses page). The webcam dev fallback never asks
+    again: it has no setup step of its own."""
+    if force or not settings.setup_done:
+        return True
+    return _has_eye_cameras(report) and settings.setup_hardware != report.path.name
+
+
+def _has_eye_cameras(report: ProfileReport) -> bool:
+    assert report.profile is not None
+    return any(cam.role.value.endswith("_eye") for cam in report.profile.enabled_cameras.values())
 
 
 class EyeMouseApp:
@@ -84,6 +107,7 @@ class EyeMouseApp:
             recalibrate=self.recalibrate,
             settings=self.open_settings,
             quit=self.quit,
+            problem=lambda: self.problems.shown,
         ))
         self.hotkeys = CtrlOptHotkeys({
             KEY_G: self.toggle_pause,
@@ -92,6 +116,53 @@ class EyeMouseApp:
         self.setup: SetupWindow | None = None
         self.settings_window: SettingsWindow | None = None
         self._calibration: EyeMouseCalibration | None = None
+
+        # Hardware problems are shown, never only logged: a banner for errors, the menu bar
+        # and a notification for both.
+        self.problems = ProblemMonitor()
+        self.banner = WarningBanner()
+        self._problem_timer = QTimer()
+        self._problem_timer.setInterval(_PROBLEM_CHECK_MS)
+        self._problem_timer.timeout.connect(self.check_hardware)
+        self._problem_timer.start()
+
+    # -- hardware ------------------------------------------------------------
+
+    def check_hardware(self) -> None:
+        before = self.problems.shown
+        denied = camera_permission_status() in (CameraPermission.DENIED,
+                                                CameraPermission.RESTRICTED)
+        now = self.problems.update(self.engine.problem(camera_denied=denied), time.monotonic())
+        if now == before:
+            return
+        if now is None:
+            log.info("hardware OK again")
+        elif before is None or before.title != now.title:
+            log.warning("%s: %s%s", now.title, now.detail,
+                        f" [{now.technical}]" if now.technical else "")
+            if self._everyday:
+                self.menu.notify(now)
+        self._sync_banner()
+        self.menu.refresh()
+
+    def _sync_banner(self) -> None:
+        """The banner shows an error, except over calibration, which draws it itself."""
+        problem = self.problems.shown
+        if problem is not None and problem.severity == "error" and self._calibration is None:
+            self.banner.show_problem(problem)
+        else:
+            self.banner.clear()
+
+    def uses_glasses(self) -> bool:
+        """False only for a developer's webcam profile (``--profile``)."""
+        return _has_eye_cameras(self.report)
+
+    def scan_glasses(self) -> GlassesScan:
+        """A scan with the profile's serial settings."""
+        assert self.report.profile is not None
+        cams = self.report.profile.enabled_cameras
+        options = cams["left_eye"].options if "left_eye" in cams else {}
+        return GlassesScan(options.get("baud"), options.get("receiver_dir"))
 
     @staticmethod
     def _later(fn: Callable[[], None]) -> Callable[[], None]:
@@ -108,10 +179,10 @@ class EyeMouseApp:
 
     def run(self, force_setup: bool = False) -> int:
         signal.signal(signal.SIGINT, signal.SIG_DFL)  # Ctrl+C in the terminal quits
-        if self.settings.setup_done and not force_setup:
-            self.start_everyday()
-        else:
+        if needs_setup(self.settings, self.report, force_setup):
             self.show_setup()
+        else:
+            self.start_everyday()
         try:
             return self.qt.exec()
         finally:
@@ -121,6 +192,8 @@ class EyeMouseApp:
         self.qt.quit()
 
     def shutdown(self) -> None:
+        self._problem_timer.stop()
+        self.banner.clear()
         self.hotkeys.remove()
         self.menu.hide()
         self.keyboard.close()
@@ -138,6 +211,7 @@ class EyeMouseApp:
                 voice_chosen=self.set_voice,
                 has_voice_key=CartesiaConfig.from_env() is not None,
                 permission_app=_permission_app(),
+                scan_glasses=self.scan_glasses if self.uses_glasses() else None,
             ), self.settings.open_at_login)
             self.setup.go(SetupWindow.WELCOME)
         self.setup.show()
@@ -163,6 +237,7 @@ class EyeMouseApp:
     def _finish_setup(self, open_at_login: bool) -> None:
         self.setup = None
         self.settings.setup_done = True
+        self.settings.setup_hardware = self.report.path.name
         self.set_login(open_at_login)
         self.start_everyday()
 
@@ -181,12 +256,15 @@ class EyeMouseApp:
 
         def done(outcome: Outcome) -> None:
             self._calibration = None
+            self._sync_banner()
             if outcome == "retry":
                 QTimer.singleShot(0, lambda: self.calibrate(then))
             else:
                 QTimer.singleShot(0, lambda: then(outcome == "saved"))
 
-        self._calibration = run_calibration_once(runtime, self.report, self.config, done)
+        self._calibration = run_calibration_once(runtime, self.report, self.config, done,
+                                                 problem=lambda: self.problems.shown)
+        self._sync_banner()
 
     def recalibrate(self) -> None:
         self.calibrate(lambda saved: self._resume_cursor())
@@ -265,3 +343,13 @@ def run_app(
     login_args: list[str] | None = None,
 ) -> int:
     return EyeMouseApp(report, config, login_args=login_args).run(force_setup)
+
+
+def show_startup_error(title: str, detail: str) -> None:
+    """A dialog for a problem that stops EyeMouse starting (a login item has no terminal)."""
+    app = QApplication.instance() or QApplication(sys.argv[:1])
+    theme.load_fonts()
+    app.setApplicationName(theme.APP_NAME)
+    box = QMessageBox(QMessageBox.Icon.Critical, title, title)
+    box.setInformativeText(detail)
+    box.exec()

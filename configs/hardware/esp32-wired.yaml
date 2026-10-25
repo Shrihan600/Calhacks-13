@@ -1,0 +1,81 @@
+# OpenGaze glasses, wired mode: two ESP32-CAMs (OV3660, color JPEG) on USB serial, each
+# through its own Seeed XIAO RA4M1 bridge, MPU-6050 on the LEFT ESP32, plus the MacBook
+# webcam for head position/orientation (Mode C). No Wi-Fi.
+#
+# The protocol is parsed by the hardware team's receiver (opengaze-hw.zip → receiver/).
+# It is looked for in opengaze-hw/receiver in this repo, or point at it:
+#   export OPENGAZE_HW_RECEIVER=~/opengaze-hw/receiver
+#   pip install pyserial
+#
+# Ports are found automatically (port: auto): each board names itself in its telemetry, so
+# it doesn't matter which USB socket each XIAO is in. To pin a port instead:
+#   opengaze diagnostics --profile configs/hardware/esp32-wired.yaml \
+#     --left-serial /dev/cu.usbmodem1101 --right-serial /dev/cu.usbmodem1201
+# (--left-serial X is short for --set cameras.left_eye.options.port=X.)
+# The IMU uses the left camera's port. Nothing else may have the ports open, including the
+# receiver's own main.py dashboard.
+hardware_profile:
+  id: esp32-wired
+  version: 1
+  frame_design: opengaze-3dprint-v1   # bump `version` when the mounts or frame change
+
+  cameras:
+    left_eye:
+      source_type: esp32_serial
+      resolution: [320, 240]   # the firmware's default; read back and reported
+      fps: 15                  # target only; the serial link sets the real rate
+      rotation_degrees: 0      # undo how the module is mounted (flip/mirror here, not in code)
+      mirror_horizontal: false
+      mirror_vertical: false
+      mounting_position: temporal_side
+      connect_timeout_s: 8.0   # finding the port and syncing take a few seconds
+      read_timeout_s: 3.0
+      options:
+        port: auto             # or --left-serial PORT
+        baud: 921600
+
+    right_eye:
+      source_type: esp32_serial
+      resolution: [320, 240]
+      fps: 15
+      rotation_degrees: 0
+      mirror_horizontal: false
+      mirror_vertical: false
+      mounting_position: temporal_side
+      connect_timeout_s: 8.0
+      read_timeout_s: 3.0
+      options:
+        port: auto             # or --right-serial PORT
+        baud: 921600
+
+    head:
+      source_type: mac_webcam
+      device_id: auto
+      resolution: [1280, 720]
+      fps: 30
+      mounting_position: display_top
+
+  # MPU-6050 on the LEFT ESP32, on the left camera's serial port. UNTESTED: not wired yet.
+  imu:
+    source_type: wired
+    enabled: true
+    options:
+      board: left              # port: the left_eye camera's
+      gyro_units: deg_s        # what the receiver reports
+      accel_units: g
+    # Which IMU axis points to the head's right, the chin, and forward. UNVERIFIED until the
+    # board is mounted: nod and shake in diagnostics and fix the signs.
+    axes: ["+x", "+y", "+z"]
+    webcam_yaw_rate: 0.5
+    stale_timeout_s: 0.5
+
+  gaze:
+    pipeline: pupil_2d
+    detector_2d:
+      type: ellipse_fit
+      options: {}
+    closed_below_confidence: 0.3
+
+  calibration:
+    screen_mapping: per_user
+    geometry_estimation: data_driven

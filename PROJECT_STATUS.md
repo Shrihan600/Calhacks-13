@@ -13,6 +13,13 @@ MPU-6050 on the **right** board is read over I²C (GPIO13/14, unverified pins). 
 M2 15" webcam gives head pose. USB-C carries 5 V power only. Contract:
 [`docs/hardware-interface.md`](docs/hardware-interface.md).
 
+**Change (2026-10-25): wired mode.** The eye cameras now reach the Mac over USB serial, not
+Wi-Fi: two ESP32-CAMs (OV3660) behind two Seeed XIAO RA4M1 bridges, 921600 baud, CRC-framed
+JPEGs. The MPU-6050 moved to the **left** board. The hardware team's receiver parses the
+protocol; `opengaze/cameras/wired.py` (`source_type: esp32_serial`) and `WiredImuSource`
+(`imu.source_type: wired`) wrap it. Profile: `configs/hardware/esp32-wired.yaml`. The Wi-Fi
+path stays as a fallback.
+
 ## Priorities
 
 | # | priority | state |
@@ -30,6 +37,9 @@ M2 15" webcam gives head pose. USB-C carries 5 V power only. Contract:
 
 | what | how | date |
 |---|---|---|
+| Full test suite: 509 tests pass (14 new in `tests/test_wired_detect.py`) | `pytest` in the repo `.venv` (Python 3.13) on the dev Mac | 2026-10-25 |
+| Full test suite: 495 tests pass (11 in `tests/test_wired.py`; one runs the real `opengaze-hw` receiver against its serial simulator) | `pytest` in the repo `.venv` (Python 3.13) on the dev Mac | 2026-10-25 |
+| Wired mode, **simulator only**: the hardware team's receiver + `sim_serial_device.py` ×2 through `esp32_serial` and the `wired` IMU. 30 s: left 24.9 fps / right 23.9 fps, 6 / 19 frames lost to injected CRC corruption (~2%), 0 reconnects, IMU 100 Hz, accel +9.81 m/s² on z | `opengaze headless --profile configs/hardware/esp32-wired.yaml --left-serial /dev/ttysN --right-serial /dev/ttysM --set cameras.{left,right}_eye.options.baud=230400 --set cameras.head.enabled=false --metrics` | 2026-10-25 |
 | Full test suite: 474 tests pass (9 new in `tests/test_consumer.py`) | `pytest` in a Python 3.13 venv on the dev Mac | 2026-10-25 |
 | EyeMouse (`opengaze app`) screens render to the consumer design: setup pages, calibration, practice, keyboard, settings | offscreen Qt screenshots; calibration against a synthetic camera | 2026-10-25 |
 | EyeMouse native windows: setup window, non-activating keyboard panel, floating mic + pill, menu bar item | short Cocoa run on the dev Mac (no camera, no gaze) | 2026-10-25 |
@@ -47,6 +57,28 @@ M2 15" webcam gives head pose. USB-C carries 5 V power only. Contract:
 - Voice typing end to end (needs a Cartesia key), and the mic's caret placement across apps
   (Notes, Messages, Safari, Chrome, Electron apps report caret bounds differently).
 - The login item actually starting EyeMouse at the next login.
+
+## Not verified: wired mode
+
+- [x] The adapter against the real receiver package and its simulator (see Verified)
+- [ ] The receiver's Python 3.13 fix (`_handle` → `_handle_packet` in `serial_client.py` and
+      `imu_client.py`) taken upstream by the hardware team, or re-applied after a re-unzip
+- [ ] Camera firmware and XIAO bridge compile (hardware team: not compiled yet)
+- [ ] Real fps per camera over serial, latency, `crc_errors` / stalls; whether the XIAO keeps
+      up at 921600 baud
+- [ ] MPU-6050 on the left board (not wired yet); units and `axes`
+- [ ] Pupil contrast on OV3660 color images under room light (no IR, by decision)
+- [ ] Left/right frame skew (assume no better than one frame period until measured)
+- [x] Automatic port detection: left/right told apart by the real receiver against two
+      simulator pseudo-terminals listed in reverse order (left 0.07 s via IMU packets, right
+      0.64 s via STATUS); unit tests with a fake receiver for scan, unplug, IMU reopen
+      and the setup page. EyeMouse always runs on the glasses (webcam only via `--profile`,
+      for development)
+- [x] Hardware problems shown to the user (banner, notification, menu line, startup dialog):
+      unit tests, the real camera manager with glasses unplugged / one board missing, and an
+      offscreen render of the banner. Not yet seen in a real Cocoa session
+- [ ] Automatic detection with real XIAOs: that they appear as `/dev/cu.usbmodem*`, and that
+      opening every candidate port doesn't upset other USB serial devices
 
 ## Not verified (needs hardware)
 

@@ -4,6 +4,9 @@ Collection, fitting and validation are ``CalibrationWindow``'s. What changes is 
 person sees: a "Look at the series of dots" card to start, the lime-and-purple target, and
 no error numbers. A good fit saves and closes by itself; a poor one offers "Try again" or
 "Use it anyway".
+
+A hardware problem (e.g. the glasses unplugged) is drawn on this screen, since it covers the
+whole display, and Start waits until it's fixed. A failure to save is shown too.
 """
 
 from __future__ import annotations
@@ -21,6 +24,8 @@ from opengaze.cameras.runtime import CaptureRuntime
 from opengaze.config.loader import ProfileReport
 from opengaze.config.schema import AppConfig
 from opengaze.consumer import theme
+from opengaze.consumer.problems import Problem
+from opengaze.consumer.warning_banner import banner_rect, paint_problem
 from opengaze.desktop.calibration_ui import _FLASH_MS, CalibrationWindow, _State
 
 Outcome = Literal["saved", "cancelled", "retry"]
@@ -36,14 +41,17 @@ class EyeMouseCalibration(CalibrationWindow):
         report: ProfileReport,
         config: AppConfig,
         on_done: Callable[[Outcome], None],
+        problem: Callable[[], Problem | None] = lambda: None,
     ) -> None:
         super().__init__(runtime, report, config, CalibrationStore(), owns_runtime=False)
+        self._problem = problem
         self.setWindowTitle(f"{theme.APP_NAME} — Calibrate")
         self.setStyleSheet(f"background: {theme.CREAM};")
         self.setCursor(Qt.CursorShape.BlankCursor)
         self._on_done = on_done
         self._outcome: Outcome = "cancelled"
         self._failed = False  # the last attempt couldn't be fitted
+        self._save_failed = False
         self._buttons: dict[str, QRect] = {}
 
     # -- flow --------------------------------------------------------------
@@ -55,10 +63,18 @@ class EyeMouseCalibration(CalibrationWindow):
         elif self._validation is None or self._validation.passed:
             self._accept()
 
+    def _blocking(self) -> Problem | None:
+        problem = self._problem()
+        return problem if problem is not None and problem.severity == "error" else None
+
     def _accept(self) -> None:
         self._save_and_close()
-        if self._saved:
-            self._outcome = "saved"
+        if not self._saved:  # logged by the base class; say so here, and let them retry
+            self._save_failed = True
+            self._state = _State.IDLE
+            self.update()
+            return
+        self._outcome = "saved"
         self.close()
 
     def _retry(self) -> None:
@@ -68,7 +84,10 @@ class EyeMouseCalibration(CalibrationWindow):
     def _on_advance(self) -> None:
         if self._state == _State.RESULT:
             self._retry()
+        elif self._state == _State.IDLE and self._blocking() is not None:
+            return  # the banner on screen says why
         else:
+            self._save_failed = False
             super()._on_advance()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
@@ -114,6 +133,9 @@ class EyeMouseCalibration(CalibrationWindow):
         elif self._state == _State.RESULT:
             self._paint_dots(p, active=None)
             self._paint_result(p)
+        problem = self._blocking()
+        if problem is not None:
+            paint_problem(p, QRectF(banner_rect(self.rect(), problem)), problem)
         p.end()
 
     def _point_px(self, i: int) -> QPointF:
@@ -208,17 +230,23 @@ class EyeMouseCalibration(CalibrationWindow):
     def _paint_intro(self, p: QPainter) -> None:
         card = self._card(p, _CARD_H)
         self._paint_ring_target(p, QPointF(card.center().x(), card.top() + 76), 0.75, 0.7)
-        if self._failed:
+        blocked = self._blocking() is not None
+        if self._save_failed:
+            title = "Couldn’t save that"
+            body = "Please try again. If it keeps happening, ask for help."
+        elif self._failed:
             title, body = "Let’s try that again", "Sit facing the screen with light on your face."
         else:
             title, body = "Look at the series of dots", "Keep your head still. Only move your eyes."
-        if not self._eye_ready:
+        if blocked:
+            body = "Fix the problem at the top of the screen first."
+        elif not self._eye_ready:
             body = "Look around the whole screen for a few seconds first."
         self._paint_copy(p, card, card.top() + 130, title, body)
         btn = QRect(0, 0, 140, _BTN_H)
         btn.moveCenter(card.center())
         btn.moveBottom(card.bottom() - 36)
-        self._button(p, btn, "Start", primary=self._eye_ready)
+        self._button(p, btn, "Start", primary=self._eye_ready and not blocked)
 
     def _paint_result(self, p: QPainter) -> None:
         card = self._card(p, 300)
@@ -236,9 +264,11 @@ def run_calibration_once(
     report: ProfileReport,
     config: AppConfig,
     on_done: Callable[[Outcome], None],
+    problem: Callable[[], Problem | None] = lambda: None,
 ) -> EyeMouseCalibration:
-    """Open the calibration screen; ``on_done`` gets the outcome when it closes."""
-    window = EyeMouseCalibration(runtime, report, config, on_done)
+    """Open the calibration screen; ``on_done`` gets the outcome when it closes. ``problem``:
+    the current hardware problem, drawn on the screen."""
+    window = EyeMouseCalibration(runtime, report, config, on_done, problem)
     window.show()
     window.raise_()
     window.activateWindow()

@@ -8,6 +8,7 @@ restyled. Calibration needs the camera to itself, so the cursor stops while it r
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Mapping
 
 from PySide6.QtGui import QFont
@@ -18,6 +19,7 @@ from opengaze.cameras.runtime import CaptureRuntime
 from opengaze.config.loader import ProfileReport
 from opengaze.config.schema import AppConfig
 from opengaze.consumer import theme
+from opengaze.consumer.problems import Problem, find_problem
 from opengaze.control.cursor import QuartzCursorDriver
 from opengaze.desktop.desktop_mode import GazeCursorOverlay, GazeStatus
 from opengaze.gaze.loop import GazeLoop
@@ -60,6 +62,7 @@ class GazeEngine:
         self.store = CalibrationStore()
         self._handlers = dict(app_handlers)
         self.runtime: CaptureRuntime | None = None
+        self._camera_started = 0.0
         self._tracker: GazeTracker | None = None
         self._overlay: EyeMouseOverlay | None = None
 
@@ -71,7 +74,22 @@ class GazeEngine:
                 CameraManager.from_profile(self.report.profile, self.config.capture)
             )
             self.runtime.start()
+            self._camera_started = time.monotonic()
         return self.runtime
+
+    def problem(self, camera_denied: bool = False) -> Problem | None:
+        """What's wrong with the cameras or the IMU, if anything (None before they start)."""
+        if self.runtime is None:
+            return None
+        imu = self._tracker.imu if self._tracker is not None else None
+        return find_problem(
+            self.runtime.manager.health(),
+            imu.health() if imu is not None else None,
+            time.monotonic() - self._camera_started,
+            capture_running=self.runtime.running,
+            camera_denied=camera_denied,
+            app_name=theme.APP_NAME,
+        )
 
     @property
     def calibrated(self) -> bool:

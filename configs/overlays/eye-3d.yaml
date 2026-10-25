@@ -1,0 +1,12 @@
+# Switch a profile's gaze to the 3D eye model: the 2D pupil detector feeds a sphere-fit eye
+# model, and gaze is a direction per eye instead of a pupil centre. Merged over the profile:
+#   eyemouse --overlay configs/overlays/eye-3d.yaml
+#   opengaze diagnostics --profile configs/hardware/esp32-wired.yaml --overlay configs/overlays/eye-3d.yaml
+# 2D and 3D keep separate calibrations, so switching back and forth doesn't overwrite either.
+# The model needs a few seconds of the eyes looking around before calibration can start.
+hardware_profile:
+  gaze:
+    pipeline: eye_3d
+    eye_model_3d:
+      type: sphere_fit
+      options: {}

@@ -15,6 +15,7 @@ from opengaze.config.schema import AppConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "default.yaml"
+GLASSES_PROFILE = REPO_ROOT / "configs" / "hardware" / "esp32-wired.yaml"  # EyeMouse's glasses
 
 log = logging.getLogger("opengaze")
 
@@ -39,10 +40,18 @@ def _load(args: argparse.Namespace) -> tuple[AppConfig, ProfileReport]:
     config = _with_cloud_flag(load_app_config(args.config), args)
     configure_logging(args.log_level or config.app.log_level)
     profile_path = Path(args.profile) if args.profile else config.app.hardware_profile
-    report = check_hardware_profile(
-        profile_path, [Path(p) for p in args.overlay], getattr(args, "set", [])
-    )
+    report = check_hardware_profile(profile_path, [Path(p) for p in args.overlay], _sets(args))
     return config, report
+
+
+def _sets(args: argparse.Namespace) -> list[str]:
+    """``--set`` overrides, plus the wired-mode ``--left-serial`` / ``--right-serial``."""
+    sets = list(getattr(args, "set", []))
+    for side in ("left", "right"):
+        port = getattr(args, f"{side}_serial", None)
+        if port:
+            sets.append(f"cameras.{side}_eye.options.port={port}")
+    return sets
 
 
 def _print_report(report: ProfileReport) -> None:
@@ -83,7 +92,7 @@ def ensure_camera_permission(report: ProfileReport) -> None:
 def cmd_validate(args: argparse.Namespace) -> int:
     configure_logging(args.log_level or "WARNING")
     report = check_hardware_profile(
-        Path(args.profile_path), [Path(p) for p in args.overlay], args.set
+        Path(args.profile_path), [Path(p) for p in args.overlay], _sets(args)
     )
     _print_report(report)
     return 0 if report.ok else 1
@@ -450,10 +459,27 @@ def cmd_desktop(args: argparse.Namespace) -> int:
 
 
 def cmd_app(args: argparse.Namespace) -> int:
-    """EyeMouse, the consumer app: guided setup, then gaze control from the menu bar."""
-    config, report = _load(args)
+    """EyeMouse, the consumer app: guided setup, then gaze control from the menu bar.
+
+    It runs on the glasses. --profile is for development only (e.g. the webcam-only profile
+    when there are no glasses to hand).
+    """
+    config = _with_cloud_flag(load_app_config(args.config), args)
+    configure_logging(args.log_level or config.app.log_level)
+    profile = Path(args.profile) if args.profile else GLASSES_PROFILE
+    report = check_hardware_profile(profile, [Path(p) for p in args.overlay], _sets(args))
     if not report.ok:
         _print_report(report)
+        if sys.platform == "darwin":
+            try:
+                from opengaze.consumer.app import show_startup_error
+            except ImportError:
+                return 1
+            show_startup_error(
+                "EyeMouse can’t start",
+                f"Its hardware settings ({report.path.name}) have errors:\n"
+                + "\n".join(f"• {issue}" for issue in report.errors),
+            )
         return 1
     if sys.platform != "darwin":
         print("EyeMouse is macOS-only")
@@ -469,7 +495,7 @@ def cmd_app(args: argparse.Namespace) -> int:
         login_args += ["--profile", str(Path(args.profile).resolve())]
     for overlay in args.overlay:
         login_args += ["--overlay", str(Path(overlay).resolve())]
-    for item in args.set:
+    for item in _sets(args):
         login_args += ["--set", item]
     return run_app(report, config, force_setup=args.setup, login_args=login_args)
 
@@ -670,6 +696,16 @@ def build_parser() -> argparse.ArgumentParser:
             help="override one profile setting, e.g. "
             "cameras.left_eye.options.host=192.168.1.42 (repeatable)",
         )
+        add_serial_args(p)
+
+    def add_serial_args(p: argparse.ArgumentParser) -> None:
+        for side in ("left", "right"):
+            p.add_argument(
+                f"--{side}-serial",
+                metavar="PORT",
+                help=f"wired mode: the {side} eye camera's serial port, e.g. "
+                "/dev/cu.usbmodem1101 (default: found automatically)",
+            )
 
     def add_metrics_args(p: argparse.ArgumentParser) -> None:
         p.add_argument(
@@ -736,6 +772,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("profile_path")
     p.add_argument("--overlay", action="append", default=[])
     p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    add_serial_args(p)
     p.set_defaults(func=cmd_validate)
 
     p = sub.add_parser(

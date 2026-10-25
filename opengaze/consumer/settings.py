@@ -23,6 +23,9 @@ LOGIN_ITEM_LABEL = "com.opengaze.eyemouse"
 @dataclass
 class AppSettings:
     setup_done: bool = False
+    # The hardware profile (file name) setup was done with: other hardware runs setup again,
+    # e.g. the glasses after a webcam-only setup.
+    setup_hardware: str = ""
     # Voice typing sends audio to Cartesia while the mic is on; the person turns it on in
     # setup ("Allow microphone") or in Settings.
     voice_typing: bool = False

@@ -129,7 +129,9 @@ Download the MediaPipe face model (~5 MB, done once):
 
 The everyday app, built from the consumer design. The developer commands below stay as they are.
 
-**First run (done by a helper):** Welcome → allow the camera → turn on Accessibility (the page
+**First run (done by a helper):** Welcome → **connect your glasses** (plug both cables into
+any USB ports; each eye's picture appears when its board is found, and Continue unlocks when
+both are) → allow the camera → turn on Accessibility (the page
 moves on by itself once it's on) → allow the microphone or skip voice → 9-dot calibration
 (fullscreen; a poor fit offers *Try again* / *Use it anyway*) → **Try it out**, where the gaze
 cursor is live: double blink a circle, right wink a card, hold a left wink to drag a block.
@@ -147,6 +149,29 @@ gaze switch and its status (*Tracking well*, *Looking for your face*, *Mouse in 
 - **Gaze keyboard:** a dark panel along the bottom of the screen. It never takes focus, so it
   types into whatever app you were in. Look at a key and double blink; word suggestions
   complete the current word; Send presses Return.
+
+**Always the glasses:** EyeMouse loads `configs/hardware/esp32-wired.yaml` (the glasses plus
+this Mac's camera for head position). There is no webcam-only option for users. The cameras keep looking for the
+glasses if they're unplugged.
+
+**Problems are shown, never only logged.** Once a problem lasts 2 s, EyeMouse shows it (a
+camera still connecting gets 10 s after start; one whose port search has given up counts at
+once, so unplugged glasses show within about 6 s):
+- **Stops gaze control** (glasses or one eye camera not connected, no video, the receiver
+  missing, this Mac's camera not working or not allowed): a red banner at the top of the
+  screen until it's fixed (drawn inside calibration, whose Start waits for the fix), a
+  notification, and a ⚠ line in the menu.
+- **Gaze control still works** (the head motion sensor isn't sending): a notification and the
+  ⚠ menu line.
+- **Can't start** (invalid hardware settings): a dialog, since a login item has no terminal.
+To try the 3D eye model instead of 2D pupil centres:
+`eyemouse --overlay configs/overlays/eye-3d.yaml` (2D and 3D calibrate separately; the login
+item keeps whatever options the app was started with).
+Development fallback without glasses: `opengaze app --profile configs/hardware/webcam-only.yaml`
+(setup then skips the glasses page). Setup remembers which profile it was done with
+(`setup_hardware` in `eyemouse.json`) and runs again for glasses it wasn't done with, so a
+webcam-only setup from before is followed by the glasses page. The webcam fallback never
+re-runs setup.
 
 EyeMouse's choices live in `~/.config/opengaze/eyemouse.json`; calibrations are shared with
 the other commands. Run from a terminal, macOS grants camera and Accessibility to *that
@@ -496,6 +521,43 @@ The ESP32 profile is Mode C. Once both streams and the IMU are up, `opengaze cal
 `opengaze run` use them like any other eye cameras. Bench-test live Wi-Fi at the boards'
 documented 20 cm antenna separation, not on someone's head, until the RF-exposure review is
 done.
+
+## ESP32-CAM glasses (wired, USB serial)
+
+The hardware team replaced Wi-Fi with USB serial (2026-10-25). Two ESP32-CAMs (OV3660,
+color JPEG, 320×240) each reach the Mac through their own Seeed XIAO RA4M1 bridge, so the
+Mac sees two `/dev/cu.usbmodem*` ports. The MPU-6050 is now on the **left** board, on the
+same port as the left camera. The protocol is parsed by the hardware team's receiver
+(`opengaze-hw.zip` → `receiver/`), which `opengaze/cameras/wired.py` wraps behind the usual
+camera and IMU contracts. The Wi-Fi profile above still works as a fallback.
+
+```bash
+pip install pyserial
+unzip opengaze-hw.zip                      # → opengaze-hw/receiver; or set OPENGAZE_HW_RECEIVER
+.venv/bin/opengaze diagnostics --profile configs/hardware/esp32-wired.yaml
+```
+
+Ports are found automatically (`port: auto`): each camera, when it connects, opens every
+`/dev/cu.usbmodem*` and `/dev/cu.usbserial*` port and waits for its board to name itself (the
+device id in the telemetry each board sends once a second; the left one's IMU packets
+too). Any USB socket works, and a reconnect looks again, so moving a cable doesn't need a
+restart. To pin a port instead: `--left-serial /dev/cu.usbmodem1101 --right-serial …`. Port
+names don't affect a calibration. Another serial device plugged in is opened briefly
+during the search and then let go. Only one program can hold a port: quit the receiver's own
+`main.py` dashboard first. Flip or mirror the images with `rotation_degrees` /
+`mirror_horizontal` / `mirror_vertical` in the profile.
+
+No hardware? The receiver's simulator serves pseudo-terminals (frames are labelled EMULATED).
+macOS pseudo-terminals reject 921600 baud, so open them at 230400; the simulator still paces
+itself at 921600:
+
+```bash
+.venv/bin/python opengaze-hw/receiver/tools/sim_serial_device.py --role left    # prints /dev/ttysN
+.venv/bin/python opengaze-hw/receiver/tools/sim_serial_device.py --role right   # prints /dev/ttysM
+.venv/bin/opengaze diagnostics --profile configs/hardware/esp32-wired.yaml \
+  --left-serial /dev/ttysN --right-serial /dev/ttysM --set cameras.head.enabled=false \
+  --set cameras.left_eye.options.baud=230400 --set cameras.right_eye.options.baud=230400
+```
 
 ## Eye cameras (Modes B/C)
 

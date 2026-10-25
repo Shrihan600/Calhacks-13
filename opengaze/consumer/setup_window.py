@@ -1,5 +1,5 @@
-"""EyeMouse setup, done by a helper: Welcome → Camera → Accessibility → Microphone →
-(calibration, fullscreen) → Try it out → Done.
+"""EyeMouse setup, done by a helper: Welcome → Glasses → Camera → Accessibility → Microphone
+→ (calibration, fullscreen) → Try it out → Done.
 
 The window only collects permissions and choices; ``EyeMouseApp`` runs calibration and
 starts the gaze cursor when this window asks it to.
@@ -10,9 +10,11 @@ from __future__ import annotations
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Protocol
 
+import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QCloseEvent, QPainter, QPen
+from PySide6.QtGui import QCloseEvent, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
@@ -31,6 +33,7 @@ from opengaze.cameras.permissions import (
     request_camera_permission,
     request_microphone_permission,
 )
+from opengaze.cameras.types import CameraError
 from opengaze.consumer import art, theme
 from opengaze.consumer.practice import PracticeStage, paint_check, paint_eyes
 from opengaze.control.ax import prompt_for_accessibility
@@ -38,6 +41,7 @@ from opengaze.control.cursor import is_accessibility_granted, open_accessibility
 
 _W, _H = 880, 600
 _ACCESS_POLL_MS = 1000
+_GLASSES_POLL_MS = 200
 
 # What each eye gesture does, as the practice page teaches it:
 # (left eye open, right eye open, gesture, action).
@@ -58,6 +62,14 @@ def open_privacy_pane(pane: str) -> None:
     )
 
 
+class Scan(Protocol):
+    """What the glasses page needs of ``opengaze.cameras.wired.GlassesScan``."""
+
+    def poll(self) -> dict[str, str]: ...
+    def image(self, board: str, found: dict[str, str]) -> np.ndarray | None: ...
+    def close(self) -> None: ...
+
+
 @dataclass
 class SetupHooks:
     """What the setup window asks of the app."""
@@ -68,6 +80,8 @@ class SetupHooks:
     voice_chosen: Callable[[bool], None]
     has_voice_key: bool
     permission_app: str              # whose permissions macOS checks (us, or the terminal)
+    # Finds the glasses. None: a developer's webcam-only profile, so there's nothing to connect.
+    scan_glasses: Callable[[], Scan] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -260,15 +274,133 @@ class _NumberedRow(QWidget):
         p.end()
 
 
+class EyePreview(QWidget):
+    """One eye camera's live picture, or what it's waiting for."""
+
+    def __init__(self, side: str) -> None:
+        super().__init__()
+        self.side = side
+        self.image: QImage | None = None
+        self.connected = False
+        self.setFixedSize(170, 150)
+
+    def show_frame(self, connected: bool, image: np.ndarray | None) -> None:
+        from opengaze.desktop.diagnostics import to_qimage
+
+        self.connected = connected
+        self.image = to_qimage(image) if connected and image is not None else None
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        box = QRectF(0, 0, self.width(), self.height() - 28).adjusted(1, 1, -1, -1)
+        p.setPen(QPen(theme.qcolor(theme.LINE), 1))
+        p.setBrush(theme.qcolor("#FFFFFF"))
+        p.drawRoundedRect(box, 14, 14)
+        if self.image is not None:
+            scaled = self.image.scaled(box.size().toSize(),
+                                       Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                       Qt.TransformationMode.SmoothTransformation)
+            clip = QPainterPath()
+            clip.addRoundedRect(box, 14, 14)
+            p.save()
+            p.setClipPath(clip)
+            p.drawImage(QPointF(box.center().x() - scaled.width() / 2,
+                                box.center().y() - scaled.height() / 2), scaled)
+            p.restore()
+        else:
+            p.setPen(theme.qcolor(theme.MUTED))
+            p.setFont(theme.text_font(13, 500))
+            p.drawText(box, Qt.AlignmentFlag.AlignCenter,
+                       "Connected" if self.connected else "Waiting…")
+        label = QRectF(0, self.height() - 22, self.width(), 22)
+        if self.connected:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(theme.qcolor(theme.LIME))
+            p.drawEllipse(QPointF(9, label.center().y()), 7, 7)
+            paint_check(p, QPointF(9, label.center().y()), 13, theme.PURPLE)
+        else:
+            p.setPen(QPen(theme.qcolor(theme.FAINT), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(9, label.center().y()), 5, 5)
+        p.setPen(theme.qcolor(theme.INK))
+        p.setFont(theme.text_font(14, 600))
+        p.drawText(label.adjusted(24, 0, 0, 0), Qt.AlignmentFlag.AlignVCenter,
+                   f"{self.side.capitalize()} eye")
+        p.end()
+
+
+class GlassesPage(Page):
+    """Finds the glasses on whichever USB ports they're in, and shows both eye cameras."""
+
+    def __init__(self, hooks: SetupHooks, back: Callable[[], None],
+                 forward: Callable[[], None]) -> None:
+        super().__init__(0)
+        self._hooks = hooks
+        self._scan: Scan | None = None
+        self.found: dict[str, str] = {}
+        self.text.addStretch(1)
+        self.heading("Connect your glasses",
+                     "Plug both glasses cables into this Mac. Any USB ports work. "
+                     "Each camera shows up here when it’s found.")
+        self.text.addSpacing(24)
+        row = QHBoxLayout()
+        row.setSpacing(20)
+        self.previews = {side: EyePreview(side) for side in ("left", "right")}
+        for preview in self.previews.values():
+            row.addWidget(preview)
+        row.addStretch(1)
+        self.text.addLayout(row)
+        self.text.addSpacing(14)
+        self.problem = _label("", "error")
+        self.problem.setMaximumWidth(400)
+        self.problem.hide()
+        self.text.addWidget(self.problem)
+        self.text.addStretch(1)
+        self.footer.addWidget(_button("Back", "ghost", back))
+        self.footer.addStretch(1)
+        self.primary = _button("Continue", "primary", forward)
+        self.primary.setEnabled(False)
+        self.footer.addWidget(self.primary)
+        self._poll = QTimer(self)
+        self._poll.setInterval(_GLASSES_POLL_MS)
+        self._poll.timeout.connect(self._check)
+
+    def on_shown(self) -> None:
+        assert self._hooks.scan_glasses is not None
+        self._scan = self._hooks.scan_glasses()
+        self._check()
+        self._poll.start()
+
+    def on_hidden(self) -> None:
+        self._poll.stop()
+        if self._scan is not None:
+            self._scan.close()
+            self._scan = None
+
+    def _check(self) -> None:
+        if self._scan is None:
+            return
+        try:
+            self.found = self._scan.poll()
+        except CameraError as exc:  # the receiver isn't installed
+            self._poll.stop()
+            self.problem.setText(str(exc))
+            self.problem.show()
+            return
+        for side, preview in self.previews.items():
+            preview.show_frame(side in self.found, self._scan.image(side, self.found))
+        self.primary.setEnabled(len(self.found) == len(self.previews))
+
+
 class CameraPage(Page):
     def __init__(self, hooks: SetupHooks, back: Callable[[], None],
                  forward: Callable[[], None]) -> None:
         super().__init__(0, art.SvgArt(art.camera_prompt(), 330, 330))
         self._hooks, self._forward = hooks, forward
         self.text.addStretch(1)
-        self.heading("Allow the camera",
-                     f"{theme.APP_NAME} follows your eyes through this Mac’s camera. "
-                     "Video is processed on this Mac and isn’t sent anywhere.")
+        self.body = self.heading("Allow the camera", "")
         self.text.addSpacing(18)
         self.problem = _label("", "error")
         self.problem.setMaximumWidth(400)
@@ -282,6 +414,12 @@ class CameraPage(Page):
         self._denied = False
 
     def on_shown(self) -> None:
+        follows = ("your head through this Mac’s camera, and your eyes through the glasses"
+                   if self._hooks.scan_glasses is not None
+                   else "your eyes through this Mac’s camera")
+        assert self.body is not None
+        self.body.setText(f"{theme.APP_NAME} follows {follows}. "
+                          "Video is processed on this Mac and isn’t sent anywhere.")
         if camera_permission_status() is CameraPermission.AUTHORIZED:
             self.primary.setText("Continue")
 
@@ -568,7 +706,7 @@ class PracticePage(QWidget):
 # ---------------------------------------------------------------------------
 
 class SetupWindow(QWidget):
-    WELCOME, CAMERA, ACCESS, MIC, PRACTICE = range(5)
+    WELCOME, GLASSES, CAMERA, ACCESS, MIC, PRACTICE = range(6)
 
     def __init__(self, hooks: SetupHooks, open_at_login: bool) -> None:
         super().__init__()
@@ -582,9 +720,14 @@ class SetupWindow(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.stack)
         go = self.go
+        # Without a glasses scan the glasses page is skipped (but keeps its index).
+        ask = hooks.scan_glasses is not None
+        before_camera = self.GLASSES if ask else self.WELCOME
         self.pages: list[QWidget] = [
-            WelcomePage(lambda: go(self.CAMERA)),
-            CameraPage(hooks, lambda: go(self.WELCOME), lambda: go(self.ACCESS)),
+            WelcomePage(lambda: go(self.GLASSES if ask else self.CAMERA)),
+            GlassesPage(hooks, lambda: go(self.WELCOME), lambda: go(self.CAMERA))
+            if ask else QWidget(),
+            CameraPage(hooks, lambda: go(before_camera), lambda: go(self.ACCESS)),
             AccessibilityPage(hooks, lambda: go(self.CAMERA), lambda: go(self.MIC)),
             MicrophonePage(hooks, lambda: go(self.ACCESS), hooks.calibrate),
             PracticePage(hooks.calibrate, self._done, open_at_login),
