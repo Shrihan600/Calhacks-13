@@ -506,29 +506,42 @@ def _make_report(profile) -> object:
     return ProfileReport(path=None, profile=profile, issues=[], mode=mode)  # type: ignore[arg-type]
 
 
+def schema_for(report: ProfileReport) -> str:
+    assert report.profile is not None
+    mode = infer_mode({cam.role for cam in report.profile.enabled_cameras.values()})
+    return _SCHEMA_MAP.get(mode, "A-webcam")
+
+
+def ensure_calibration(
+    runtime: CaptureRuntime, report: ProfileReport, config: AppConfig, schema_id: str,
+) -> None:
+    """Run the calibration wizard (blocking) if this hardware has no calibration."""
+    app = QApplication.instance()
+    store = CalibrationStore()
+    if store.exists(schema_id, report.profile):  # type: ignore[arg-type]
+        return
+    print("No calibration found — running calibration first…")
+    from opengaze.desktop.calibration_ui import CalibrationWindow
+    cal_win = CalibrationWindow(runtime, report, config, store, owns_runtime=False)
+    cal_win.show()
+    while cal_win.isVisible():
+        app.processEvents()
+        time.sleep(0.03)
+    if not store.exists(schema_id, report.profile):  # type: ignore[arg-type]
+        print("Calibration was not saved — continuing without a model.")
+
+
 def run_gaze_test(report: ProfileReport, config: AppConfig) -> int:
     assert report.profile is not None
     app = QApplication.instance() or QApplication(sys.argv[:1])
 
-    mode = infer_mode({cam.role for cam in report.profile.enabled_cameras.values()})
-    schema_id = _SCHEMA_MAP.get(mode, "A-webcam")
+    schema_id = schema_for(report)
 
     # Start runtime once — shared between calibration and gaze test so the camera
     # stays on continuously (no pause/restart between phases).
     runtime = CaptureRuntime(CameraManager.from_profile(report.profile, config.capture))
     runtime.start()
-
-    store = CalibrationStore()
-    if not store.exists(schema_id, report.profile):  # type: ignore[arg-type]
-        print("No calibration found — running calibration first…")
-        from opengaze.desktop.calibration_ui import CalibrationWindow
-        cal_win = CalibrationWindow(runtime, report, config, store, owns_runtime=False)
-        cal_win.show()
-        while cal_win.isVisible():
-            app.processEvents()
-            time.sleep(0.03)
-        if not store.exists(schema_id, report.profile):  # type: ignore[arg-type]
-            print("Calibration was not saved — continuing without a model.")
+    ensure_calibration(runtime, report, config, schema_id)
 
     window = GazeTestWindow(runtime, report, config, schema_id)
     window.show()

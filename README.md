@@ -19,6 +19,7 @@ You look at the screen. The software tracks where your eyes are pointing and mov
 | Voice dictation — Cartesia Ink-Whisper STT | **Working** (opt-in, needs API key) |
 | Speak typed text — Cartesia Sonic TTS (macOS `say` offline) | **Working** |
 | System-wide voice bar — dictate into any app, read any selection aloud | **Working** |
+| System-wide gaze cursor — look + blink-click in every app (`opengaze desktop`) | **Working** |
 | Target practice game | **Working** |
 | Eye-camera glasses support (Mode C) | Architecture ready, hardware pending |
 | AAC communication board + Claude AI | Planned |
@@ -190,6 +191,22 @@ Typing by gaze takes about 2–5 seconds per letter. Many people who need eye-ga
 
 Without both a key and the opt-in, nothing is sent anywhere: `SPEAK` uses macOS `say`, and `MIC` shows a message explaining how to enable it.
 
+### System-wide gaze control (every app)
+
+```bash
+.venv/bin/opengaze desktop --cloud
+```
+
+No fullscreen window: the real macOS cursor follows your gaze in every app, and a **long blink clicks** wherever you were looking. A yellow ring fills around the cursor as you hold the blink, so you can see a click coming. The voice bar below floats on top, so you can blink-click 🎤 to dictate into the app you're using.
+
+| Control | How |
+|---|---|
+| Pause / resume gaze cursor | `⌃⌥G`, or click 👁 on the voice bar |
+| Take over with the mouse | Just move it; gaze waits 2 s after you stop |
+| Quit | Right-click the voice bar → Quit, or Ctrl+C in the terminal |
+
+Uses your saved calibration (runs the wizard first if there isn't one). Needs Accessibility permission for the terminal app. If tracking feels off, recalibrate with `opengaze calibrate`, and try the practice game (`opengaze run` → G) to get used to blink-clicking.
+
 ### System-wide voice bar
 
 ```bash
@@ -220,7 +237,7 @@ The code is in `opengaze/voice/`: `cartesia.py` (stdlib-only REST client), `audi
 
 - Dictation is batch: words appear after you stop talking (usually under a second or two), not while you speak
 - The system-wide bar's hotkeys are fixed (⌃⌥D / ⌃⌥S) and assume key positions on a US layout
-- The gaze test window is fullscreen, so gaze-clicking the bar while using other apps needs a system-wide gaze cursor mode (not built yet). The hotkeys and a normal mouse work today
+- Pausing gaze from the bar's 👁 button with your eyes means resuming needs `⌃⌥G` or the mouse, since the gaze cursor is off
 - Cartesia's batch `/stt` occasionally stalls; requests time out after 10 s and retry once
 - End-of-speech detection uses a fixed loudness threshold, so a noisy room may keep it listening until the 20 s cap
 - No offline speech-to-text fallback; if Cartesia is unreachable, an error shows and you type instead
@@ -358,12 +375,17 @@ opengaze/
     dwell.py                      DwellDetector: hold gaze → click (unused in main UI)
     safety.py                     ConfidenceGate, JumpDetector, EmergencyStop
     cursor.py                     QuartzCursorDriver: macOS CGEvent move + click
+    tracker.py                    GazeTracker (headless pipeline), UserOverride (mouse wins)
+    keystrokes.py                 Type Unicode into the focused app, copy selection
     driver.py                     GazeDriver: full pipeline orchestrator
   desktop/
     calibration_ui.py             PySide6 calibration wizard (9 dots, validation heatmap)
     run_ui.py                     Fullscreen gaze test environment
     keyboard_ui.py                On-screen gaze keyboard with dictation + speech
     practice_ui.py                Target practice game
+    desktop_mode.py               System-wide gaze cursor: click-through overlay + voice bar
+    dictation_ui.py               Floating voice bar: dictate into any app, read selection aloud
+    macwin.py                     Floating, non-activating, all-Spaces window helpers
     diagnostics.py                Live camera health + preview window
   voice/
     cartesia.py                   Cartesia REST client: Ink-Whisper STT, Sonic TTS

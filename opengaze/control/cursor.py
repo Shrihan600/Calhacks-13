@@ -95,6 +95,12 @@ class QuartzCursorDriver:
         Q.CGEventPost(Q.kCGHIDEventTap, down)
         Q.CGEventPost(Q.kCGHIDEventTap, up)
 
+    def position(self) -> tuple[float, float]:
+        """Current cursor location in logical points (origin top-left)."""
+        Q = self._Q
+        loc = Q.CGEventGetLocation(Q.CGEventCreate(None))
+        return (loc.x, loc.y)
+
     def norm_to_px(self, x_norm: float, y_norm: float) -> tuple[int, int]:
         """Convert normalised [0,1] coordinates to screen pixels."""
         return (

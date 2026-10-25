@@ -335,3 +335,31 @@ class TestGazeDriver:
         for _ in range(10):
             driver.push(_fv(0.5, 0.5))
         assert driver.frames_processed == 10
+
+
+# ---------------------------------------------------------------------------
+# UserOverride (system-wide gaze yields to a physical mouse)
+# ---------------------------------------------------------------------------
+
+def test_override_allows_gaze_when_cursor_where_we_left_it():
+    from opengaze.control.tracker import UserOverride
+
+    o = UserOverride(tolerance_px=20, hold_s=2.0)
+    o.moved_to(100, 100)
+    assert o.gaze_allowed((105, 98), now=10.0)
+
+
+def test_override_holds_after_physical_mouse_move():
+    from opengaze.control.tracker import UserOverride
+
+    o = UserOverride(tolerance_px=20, hold_s=2.0)
+    o.moved_to(100, 100)
+    assert not o.gaze_allowed((400, 300), now=10.0)
+    assert not o.gaze_allowed((410, 300), now=11.5)
+    assert o.gaze_allowed((410, 300), now=12.1)
+
+
+def test_override_before_any_gaze_move_allows():
+    from opengaze.control.tracker import UserOverride
+
+    assert UserOverride().gaze_allowed((0, 0), now=0.0)

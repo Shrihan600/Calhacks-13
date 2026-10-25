@@ -298,6 +298,43 @@ def cmd_dictate(args: argparse.Namespace) -> int:
     return run_dictation_bar(voice)
 
 
+def cmd_desktop(args: argparse.Namespace) -> int:
+    """System-wide gaze cursor + voice bar over every app."""
+    from opengaze.voice.cartesia import CartesiaConfig
+    from opengaze.voice.service import VoiceService
+
+    config, report = _load(args)
+    if not report.ok:
+        _print_report(report)
+        return 1
+    if sys.platform != "darwin":
+        print("system-wide gaze control is macOS-only")
+        return 1
+    try:
+        from opengaze.desktop.desktop_mode import run_desktop_mode
+    except ImportError as exc:
+        print(f"desktop UI unavailable ({exc}); install with: pip install -e '.[all]'")
+        return 1
+    from opengaze.control.cursor import is_accessibility_granted, open_accessibility_prefs
+
+    if not is_accessibility_granted():
+        print("Accessibility permission is required to move the cursor in other apps.\n"
+              "Grant it to this terminal app in System Settings › Privacy & Security ›\n"
+              "Accessibility (opening it now), then rerun.")
+        open_accessibility_prefs()
+        return 1
+    ensure_camera_permission(report)
+    voice = VoiceService(
+        cloud_enabled=config.privacy.cloud_features_enabled,
+        cartesia=CartesiaConfig.from_env(),
+    )
+    print(voice.status)
+    print("Gaze cursor is ON across all apps. Long blink = click.\n"
+          "⌃⌥G pause/resume gaze · ⌃⌥D dictate · ⌃⌥S read selection · "
+          "moving the mouse takes over for 2 s · Ctrl+C here to quit.")
+    return run_desktop_mode(report, config, voice)
+
+
 def cmd_calibrate(args: argparse.Namespace) -> int:
     config, report = _load(args)
     if not report.ok:
@@ -391,6 +428,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text", default="Hi, I'm using OpenGaze to talk with my eyes.",
                    help="sentence to speak in the TTS step")
     p.set_defaults(func=cmd_voice_test)
+
+    p = sub.add_parser("desktop", help="gaze cursor + voice bar across every app (macOS)")
+    add_profile_args(p)
+    p.add_argument("--cloud", action="store_true",
+                   help="opt into Cartesia voice for this session")
+    p.set_defaults(func=cmd_desktop)
 
     p = sub.add_parser("dictate", help="system-wide voice bar: dictate into any app (Cartesia)")
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="app config YAML")
