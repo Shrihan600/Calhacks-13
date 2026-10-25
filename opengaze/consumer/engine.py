@@ -67,6 +67,8 @@ class GazeEngine:
         self._overlay: EyeMouseOverlay | None = None
         # `opengaze app --fresh`: act as if there's no calibration until one is saved this run.
         self.ignore_saved_calibration = False
+        # `opengaze app --no-tracking`: the gaze cursor never runs this session.
+        self.tracking_disabled = False
 
     # -- camera ------------------------------------------------------------
 
@@ -109,7 +111,7 @@ class GazeEngine:
         """Follow gaze with the real cursor, from the saved calibration. False if there's none."""
         self.stop_cursor()
         runtime = self.start_camera()
-        if self.ignore_saved_calibration:
+        if self.ignore_saved_calibration or self.tracking_disabled:
             return False
         try:
             bundle = self.store.load_bundle(self.schema_id, self.report.profile)  # type: ignore[arg-type]

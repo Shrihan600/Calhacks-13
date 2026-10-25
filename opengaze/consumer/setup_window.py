@@ -674,8 +674,12 @@ class PracticePage(QWidget):
         footer.addWidget(_button("Done", "primary", lambda: done(self.login.isChecked())))
         outer.addLayout(footer)
 
-    def set_tracking(self, on: bool) -> None:
-        self.tracking.setText(f"{'Stop' if on else 'Start'} tracking  {TRACKING_SHORTCUT}")
+    def set_tracking(self, on: bool, allowed: bool = True) -> None:
+        self.tracking.setEnabled(allowed)
+        if not allowed:
+            self.tracking.setText("Tracking off for this session")
+        else:
+            self.tracking.setText(f"{'Stop' if on else 'Start'} tracking  {TRACKING_SHORTCUT}")
 
     def _after_setup(self, open_at_login: bool) -> QWidget:
         box = QFrame()

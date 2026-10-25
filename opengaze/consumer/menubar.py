@@ -52,6 +52,7 @@ class MenuHooks:
     settings: Callable[[], None]
     quit: Callable[[], None]
     problem: Callable[[], Problem | None] = lambda: None  # e.g. the glasses aren't plugged in
+    tracking_allowed: Callable[[], bool] = lambda: True  # False: launched with --no-tracking
 
 
 class MenuBar:
@@ -114,6 +115,11 @@ class MenuBar:
         self.pause.setText("Resume" if status == "paused" else "Pause")
         self.pause.setEnabled(status != "off")
         self.tracking.setText("Start tracking" if status == "off" else "Stop tracking")
+        allowed = self._hooks.tracking_allowed()
+        self.gaze.setEnabled(allowed)
+        self.tracking.setEnabled(allowed)
+        if not allowed:
+            self.status.setText("Tracking off for this session")
         self.voice.setChecked(self._hooks.voice_on())
         self.tray.setToolTip(f"{theme.APP_NAME}: "
                              + (problem.title if problem else STATUS_TEXT[status]))

@@ -111,6 +111,7 @@ class EyeMouseApp:
             settings=self.open_settings,
             quit=self.quit,
             problem=lambda: self.problems.shown,
+            tracking_allowed=lambda: not self.engine.tracking_disabled,
         ))
         self.hotkeys = CtrlOptHotkeys({
             KEY_G: self.toggle_pause,
@@ -233,7 +234,8 @@ class EyeMouseApp:
             self.engine.start_cursor()
             self._tracking_off = False
             self.setup.go(SetupWindow.PRACTICE)
-            self.setup.practice.set_tracking(self.engine.running)
+            self.setup.practice.set_tracking(self.engine.running,
+                                             allowed=not self.engine.tracking_disabled)
             self.hotkeys.install()  # ⌃⌥G / ⌃⌥T work from Try it out on
         else:
             self.setup.go(SetupWindow.MIC)
@@ -279,7 +281,8 @@ class EyeMouseApp:
         self.calibrate(lambda saved: self._resume_cursor())
 
     def _resume_cursor(self) -> None:
-        if not self.engine.start_cursor() and self._everyday:
+        if not self.engine.start_cursor() and self._everyday \
+                and not self.engine.tracking_disabled:
             log.warning("no calibration to run the gaze cursor with")
 
     # -- every day ---------------------------------------------------------
@@ -315,8 +318,8 @@ class EyeMouseApp:
         """The hard off switch, for when tracking is too bad to trust: stop the gaze loop so
         nothing moves or clicks, and no stray gesture can resume it. Pressed again, it restarts
         from the saved calibration."""
-        if self._calibration is not None:
-            return  # calibrating has the camera; the cursor comes back when it's done
+        if self._calibration is not None or self.engine.tracking_disabled:
+            return  # calibrating has the camera; --no-tracking keeps it off all session
         if self.engine.running:
             self.engine.stop_cursor()
         else:
@@ -367,14 +370,17 @@ def run_app(
     *,
     force_setup: bool = False,
     fresh: bool = False,
+    tracking: bool = True,
     login_args: list[str] | None = None,
 ) -> int:
     """``fresh`` starts as if for the first time: default settings and setup, and no gaze
     tracking from the saved calibration until a new one is saved. Nothing is deleted, but the
-    settings file is rewritten as setup goes, as on a real first run."""
+    settings file is rewritten as setup goes, as on a real first run. ``tracking=False``
+    keeps the gaze cursor off all session (setup, calibration and voice typing still run)."""
     app = EyeMouseApp(report, config, login_args=login_args,
                       settings=AppSettings() if fresh else None)
     app.engine.ignore_saved_calibration = fresh
+    app.engine.tracking_disabled = not tracking
     return app.run(force_setup or fresh)
 
 

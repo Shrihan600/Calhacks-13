@@ -498,7 +498,7 @@ def cmd_app(args: argparse.Namespace) -> int:
     for item in _sets(args):
         login_args += ["--set", item]
     return run_app(report, config, force_setup=args.setup, fresh=args.fresh,
-                   login_args=login_args)
+                   tracking=not args.no_tracking, login_args=login_args)
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
@@ -824,6 +824,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fresh", action="store_true",
                    help="start as if for the first time: default settings, setup, and no "
                         "tracking until you calibrate (the saved calibration isn't deleted)")
+    p.add_argument("--no-tracking", action="store_true",
+                   help="keep the gaze cursor off all session; setup, calibration and voice "
+                        "typing still work")
     p.set_defaults(func=cmd_app)
 
     p = sub.add_parser("dictate", help="system-wide voice bar: dictate into any app (Cartesia)")

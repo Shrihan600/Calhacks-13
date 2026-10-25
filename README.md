@@ -126,6 +126,7 @@ Download the MediaPipe face model (~5 MB, done once):
 .venv/bin/opengaze app          # or: .venv/bin/eyemouse
 .venv/bin/opengaze app --setup  # run setup again
 .venv/bin/opengaze app --fresh  # as if for the first time: setup, no tracking until you calibrate
+.venv/bin/opengaze app --no-tracking  # gaze cursor off all session (combine with --fresh/--setup)
 ```
 
 The everyday app, built from the consumer design. The developer commands below stay as they are.

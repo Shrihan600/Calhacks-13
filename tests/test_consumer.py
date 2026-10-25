@@ -91,6 +91,9 @@ def test_fresh_start_ignores_the_saved_calibration(monkeypatch) -> None:
     engine.ignore_saved_calibration = True  # `opengaze app --fresh`
     assert not engine.calibrated
     assert not engine.start_cursor() and not engine.running
+    engine.ignore_saved_calibration = False
+    engine.tracking_disabled = True  # `opengaze app --no-tracking`
+    assert engine.calibrated and not engine.start_cursor() and not engine.running
 
 def _hooks(calls: list):
     from opengaze.consumer.setup_window import SetupHooks
@@ -147,6 +150,8 @@ def test_try_it_out_can_stop_tracking(qapp) -> None:
     assert calls == ["tracking"]
     page.set_tracking(False)
     assert page.tracking.text().startswith("Start tracking")
+    page.set_tracking(False, allowed=False)  # --no-tracking
+    assert not page.tracking.isEnabled()
 
 def test_closing_setup_early_quits(qapp) -> None:
     from opengaze.consumer.setup_window import SetupWindow
